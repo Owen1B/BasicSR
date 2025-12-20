@@ -1,0 +1,115 @@
+# Bone (real) 6s paired N2N training
+# Uses 3 different 6s projections per patient, paired as (1,2), (1,3), (2,3)
+# Total: 30 patients × 3 pairs = 90 training pairs
+
+name: n2n_bone_proj_6s_paired
+model_type: SPECT3DModel  # Use SPECT3DModel for automatic GIF generation during validation
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: Bone_train_6s_paired
+    type: SPECTDatPairedDataset
+    mode: paired  # Use paired mode: lq from one 6s projection, gt from another 6s projection
+    dataroot_lq: datasets/bone_projection_6s_paired/lq
+    dataroot_gt: datasets/bone_projection_6s_paired/gt
+    height: 128
+    width: 128
+
+    # dual-view format (2, 128, 128) but both channels are the same angle
+    view_mode: split1
+    view_select: both
+    posterior_flip: false
+
+    max_value: 100.0
+    clip_max_value: false
+    norm:
+      type: linear
+
+    # Patch-based training
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    start_idx: 0
+    end_idx: 5400  # 30 patients × 60 angles × 3 pairs = 5400 pairs
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 16
+    dataset_enlarge_ratio: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: null
+
+network_g:
+  type: UNetRes
+  in_nc: 1
+  out_nc: 1
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: 0.0001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [50000]
+    restart_weights: [1]
+    eta_min: 1.0e-05
+
+  total_iter: 50000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-09
+    max_value: 100.0
+    norm_type: linear
+
+# Validation with GIF generation for 3D projection data
+# Use SPECTProjectionDataset to load raw ProjectionImage*.dat files directly
+val:
+  val_freq: 1000  # Validate every 1000 iterations (same as checkpoint save frequency)
+  name: Bone_val_projection
+  type: SPECTProjectionDataset  # Direct loading of raw projection files
+  dataroot: datasets/bone_20230327  # Root directory for projection files
+  pattern: "**/6s-3/ProjectionImage1.dat"  # Use 6s projection files (matching training data)
+  height: 128
+  width: 128
+  views: 60
+
+  start_idx: 0
+  end_idx: 3  # Use first 3 projection files for validation
+
+  num_worker_per_gpu: 1
+  batch_size_per_gpu: 1
+  pin_memory: true
+
+  # Enable GIF generation for 3D data
+  generate_gif: true
+  gif_output_dir: experiments/{name}/visualization/gifs
+  max_gifs_per_val: 3  # Limit number of GIFs per validation
+
+  # No metrics for real data without clean GT
+  metrics: null

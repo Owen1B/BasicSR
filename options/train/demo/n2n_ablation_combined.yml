@@ -1,0 +1,192 @@
+# ============================================================================
+# N2N Ablation: Combined Negative Factors
+# ============================================================================
+# 目的: 复现当前过拟合问题 - 组合所有负面因素
+#
+# 消融变化 (相对于 n2n_base_aligned_kair.yml):
+#   1. weight_decay: 1e-4 → 0 (⭐⭐⭐⭐⭐ 最关键)
+#   2. eta_min: 1e-5 → 1e-7 (⭐⭐⭐⭐)
+#   3. gt_size: 64 → 256 (⭐⭐⭐⭐ 大patch)
+#   4. batch_size: 16 → 8 (⭐⭐⭐)
+#   5. norm: linear → anscombe (⭐⭐⭐)
+#   6. loss: PoissonNLL → Charbonnier (⭐⭐⭐)
+#   7. total_iter: 50000 → 20000 (更快看到过拟合)
+#   8. optimizer: AdamW → Adam (因为wd=0)
+#
+# 预期结果:
+#   应该完全复现之前的过拟合问题: PSNR/SSIM 先涨后降
+#   这证明了分析的正确性
+# ============================================================================
+
+name: n2n_ablation_combined
+
+model_type: SRModel
+scale: 1
+
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: XCAT_train_n2n
+    type: SPECTDatPairedDataset
+    mode: n2n
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+
+    view_mode: stack2
+    start_idx: 0
+    end_idx: 96
+
+    # N2N split config
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    gt_scale_factor: 1.0
+    max_value: 100.0  # ⚠️ Anscombe范围
+    norm:
+      type: anscombe  # ⚠️ 消融: Anscombe归一化
+      inverse: unbiased
+
+    gt_size: 256  # ⚠️ 消融: 大patch
+
+    use_hflip: false
+    use_rot: false
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8  # ⚠️ 消融: 小batch
+    dataset_enlarge_ratio: 1
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: ~
+
+  val:
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_mode: stack2
+    start_idx: 96
+    end_idx: 100
+
+    gt_scale_factor: 1.0
+    max_value: 100.0
+    norm:
+      type: anscombe
+      inverse: unbiased
+
+network_g:
+  type: UNetRes
+  in_nc: 2
+  out_nc: 2
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: Adam  # ⚠️ 消融: Adam (wd=0时等价)
+    lr: !!float 1e-4
+    weight_decay: 0  # ⚠️ 消融: 无weight decay (最关键!)
+    betas: [0.9, 0.99]  # beta2=0.99 (旧配置)
+
+  scheduler:
+    type: CosineAnnealingRestartLR  # ⚠️ 使用旧的scheduler
+    periods: [20000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7  # ⚠️ 消融: 过小的eta_min
+
+  total_iter: 20000  # ⚠️ 消融: 更短的训练 (更快看到过拟合)
+  warmup_iter: -1
+
+  pixel_opt:
+    type: CharbonnierLoss  # ⚠️ 消融: Charbonnier Loss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-12
+
+val:
+  val_freq: 200  # 更频繁验证以观察过拟合曲线
+  save_img: true
+
+  eval_networks: [g, ema]
+  save_img_networks: [ema]
+  pbar: false
+  suffix: ~
+  metric_domain: count
+
+  save_best_ckpt: true
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    enable: true
+    vmax_cnt: 100.0
+    vlim_res: 20.0
+    vlim_anscombe: 1.0
+
+  metrics:
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 100.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 100.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    lpips:
+      type: calculate_lpips
+      domain: count
+      better: lower
+      lpips_net: vgg
+      lpips_local_repeat_n: 10
+
+    poisson_fit:
+      type: calculate_poisson_fit
+      domain: count
+      bin_center: nearest_int
+      bin_size: 1.0
+      min_pixels_per_bin: 512
+      min_gt: 0.5
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 200
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 10
+  keep_state_num: 5
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

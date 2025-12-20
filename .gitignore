@@ -130,3 +130,5 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+spect_ct/results/*
+spect_ct/data/*

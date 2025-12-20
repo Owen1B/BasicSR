@@ -251,6 +251,50 @@ class BaseModel():
             logger.warning(f'Still cannot save {save_path}. Just ignore it.')
             # raise IOError(f'Cannot save {save_path}.')
 
+        # Optionally keep only the most recent N numeric checkpoints to save disk space.
+        # This never deletes special tags like "latest" or "best" (they are non-numeric).
+        try:
+            keep_num = self.opt.get('logger', {}).get('keep_ckpt_num', None)
+            if keep_num is not None:
+                self._cleanup_old_checkpoints(net_label=net_label, keep_num=int(keep_num))
+        except Exception as e:
+            logger = get_root_logger()
+            logger.warning(f'Checkpoint cleanup skipped due to error: {e}')
+
+    def _cleanup_old_checkpoints(self, net_label: str, keep_num: int):
+        """Delete old numeric checkpoints for a given net label, keeping only the newest `keep_num`.
+
+        Files kept:
+        - `{net_label}_latest.pth` (non-numeric)
+        - `{net_label}_best.pth` (non-numeric)
+        - newest `keep_num` numeric checkpoints: `{net_label}_<iter>.pth`
+        """
+        if keep_num is None or keep_num <= 0:
+            return
+        models_dir = self.opt.get('path', {}).get('models', None)
+        if not models_dir or not os.path.isdir(models_dir):
+            return
+
+        prefix = f'{net_label}_'
+        suffix = '.pth'
+        numeric = []
+        for fn in os.listdir(models_dir):
+            if not (fn.startswith(prefix) and fn.endswith(suffix)):
+                continue
+            tag = fn[len(prefix):-len(suffix)]
+            if not tag.isdigit():
+                continue
+            numeric.append((int(tag), fn))
+        if len(numeric) <= keep_num:
+            return
+        numeric.sort(key=lambda x: x[0])  # old -> new
+        to_delete = numeric[:-keep_num]
+        for _, fn in to_delete:
+            try:
+                os.remove(os.path.join(models_dir, fn))
+            except FileNotFoundError:
+                continue
+
     def _print_different_keys_loading(self, crt_net, load_net, strict=True):
         """Print keys with different name or different size when loading models.
 
@@ -329,6 +373,16 @@ class BaseModel():
                 state['optimizers'].append(o.state_dict())
             for s in self.schedulers:
                 state['schedulers'].append(s.state_dict())
+
+            # Save wandb ID for reliable resume
+            # `logger.wandb` can be missing or explicitly set to null in YAML.
+            # In that case, skip wandb resume bookkeeping.
+            wandb_opt = self.opt.get('logger', {}).get('wandb', None)
+            if isinstance(wandb_opt, dict):
+                wandb_id = wandb_opt.get('current_id', None)
+                if wandb_id:
+                    state['wandb_id'] = wandb_id
+
             save_filename = f'{current_iter}.state'
             save_path = os.path.join(self.opt['path']['training_states'], save_filename)
 
@@ -348,6 +402,44 @@ class BaseModel():
             if retry == 0:
                 logger.warning(f'Still cannot save {save_path}. Just ignore it.')
                 # raise IOError(f'Cannot save {save_path}.')
+
+            # Optionally keep only the most recent N training states (numeric .state files).
+            # This reduces disk usage without affecting "latest" model saving.
+            try:
+                keep_num = self.opt.get('logger', {}).get('keep_state_num', None)
+                if keep_num is None:
+                    # Backward-compatible: reuse keep_ckpt_num if keep_state_num is not specified.
+                    keep_num = self.opt.get('logger', {}).get('keep_ckpt_num', None)
+                if keep_num is not None:
+                    self._cleanup_old_training_states(keep_num=int(keep_num))
+            except Exception as e:
+                logger = get_root_logger()
+                logger.warning(f'Training state cleanup skipped due to error: {e}')
+
+    def _cleanup_old_training_states(self, keep_num: int):
+        """Delete old numeric training states, keeping only the newest `keep_num`."""
+        if keep_num is None or keep_num <= 0:
+            return
+        states_dir = self.opt.get('path', {}).get('training_states', None)
+        if not states_dir or not os.path.isdir(states_dir):
+            return
+        numeric = []
+        for fn in os.listdir(states_dir):
+            if not fn.endswith('.state'):
+                continue
+            tag = fn[:-len('.state')]
+            if not tag.isdigit():
+                continue
+            numeric.append((int(tag), fn))
+        if len(numeric) <= keep_num:
+            return
+        numeric.sort(key=lambda x: x[0])  # old -> new
+        to_delete = numeric[:-keep_num]
+        for _, fn in to_delete:
+            try:
+                os.remove(os.path.join(states_dir, fn))
+            except FileNotFoundError:
+                continue
 
     def resume_training(self, resume_state):
         """Reload the optimizers and schedulers for resumed training.

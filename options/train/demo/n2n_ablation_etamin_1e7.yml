@@ -1,0 +1,185 @@
+# ============================================================================
+# N2N Ablation: eta_min = 1e-7
+# ============================================================================
+# 目的: 测试过小的 eta_min 对训练后期的影响 (⭐⭐⭐⭐)
+#
+# 消融变化 (相对于 n2n_base_aligned_kair.yml):
+#   - eta_min: 1e-5 → 1e-7 (唯一改变，降低100倍)
+#
+# 预期结果:
+#   训练后期学习率过低但仍在更新，可能破坏已学到的平滑模式
+#   PSNR/SSIM 可能在后期出现轻微下降或震荡
+# ============================================================================
+
+name: n2n_ablation_etamin_1e7
+
+model_type: SRModel
+scale: 1
+
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: XCAT_train_n2n
+    type: SPECTDatPairedDataset
+    mode: n2n
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+
+    view_mode: stack2
+    start_idx: 0
+    end_idx: 96
+
+    # N2N split config
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+    gt_size: 64
+
+    use_hflip: false
+    use_rot: false
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 16
+    dataset_enlarge_ratio: 1
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: ~
+
+  val:
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_mode: stack2
+    start_idx: 96
+    end_idx: 100
+
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+network_g:
+  type: UNetRes
+  in_nc: 2
+  out_nc: 2
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [50000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7  # ⚠️ 消融: 降低到 1e-7 (过小)
+
+  total_iter: 50000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-9
+    max_value: 150.0
+    norm_type: linear
+
+val:
+  val_freq: 1000
+  save_img: true
+
+  eval_networks: [g, ema]
+  save_img_networks: [ema]
+  pbar: false
+  suffix: ~
+  metric_domain: count
+
+  save_best_ckpt: true
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    enable: true
+    vmax_cnt: 150.0
+    vlim_res: 30.0
+    vlim_anscombe: 1.0
+
+  metrics:
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    lpips:
+      type: calculate_lpips
+      domain: count
+      better: lower
+      lpips_net: vgg
+      lpips_local_repeat_n: 10
+
+    poisson_fit:
+      type: calculate_poisson_fit
+      domain: count
+      bin_center: nearest_int
+      bin_size: 1.0
+      min_pixels_per_bin: 512
+      min_gt: 0.5
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 10
+  keep_state_num: 5
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

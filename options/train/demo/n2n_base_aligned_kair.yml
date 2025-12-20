@@ -1,0 +1,192 @@
+# ============================================================================
+# N2N Baseline - 完全对齐 KAIR 配置
+# ============================================================================
+# 目的: 验证 BasicSR 框架是否能复现 KAIR 的结果
+#
+# 关键对齐点:
+#   1. Linear归一化 (max: 150) 而非 Anscombe
+#   2. PoissonNLL loss 而非 Charbonnier
+#   3. AdamW优化器 + weight_decay: 1e-4 (关键!)
+#   4. eta_min: 1e-5 (不是1e-7!)
+#   5. Patch size: 64 (不是256!)
+#   6. Batch size: 16 (不是8!)
+#   7. Total iter: 50000
+#   8. Orthogonal初始化 (gain: 0.2)
+#
+# 如果此配置仍然过拟合，说明BasicSR框架有问题
+# 如果此配置正常，说明之前的配置参数有问题
+# ============================================================================
+
+name: n2n_base_aligned_kair
+
+model_type: SRModel
+scale: 1
+
+num_gpu: 1
+manual_seed: 20020113  # 使用KAIR的seed确保可复现
+
+datasets:
+  train:
+    name: XCAT_train_n2n
+    type: SPECTDatPairedDataset
+    mode: n2n
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+
+    view_mode: stack2
+    start_idx: 0
+    end_idx: 96
+
+    # N2N split config
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    gt_scale_factor: 1.0
+    max_value: 150.0  # 对齐KAIR: 150 而非 100
+    norm:
+      type: linear  # 对齐KAIR: linear 而非 anscombe
+
+    gt_size: 64  # 对齐KAIR: 64 而非 256 ⭐⭐⭐⭐
+
+    use_hflip: false
+    use_rot: false
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 16  # 对齐KAIR: 16 而非 8 ⭐⭐⭐
+    dataset_enlarge_ratio: 1
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: ~
+
+  val:
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_mode: stack2
+    start_idx: 96
+    end_idx: 100
+
+    gt_scale_factor: 1.0
+    max_value: 150.0  # 对齐KAIR
+    norm:
+      type: linear  # 对齐KAIR
+
+network_g:
+  type: UNetRes
+  in_nc: 2
+  out_nc: 2
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW  # 对齐KAIR: AdamW 而非 Adam ⭐⭐⭐⭐⭐
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4  # 对齐KAIR: 1e-4 而非 0 ⭐⭐⭐⭐⭐
+    betas: [0.9, 0.999]  # AdamW默认beta2=0.999
+
+  scheduler:
+    type: CosineAnnealingRestartLR  # BasicSR使用CosineAnnealingRestartLR
+    periods: [50000]  # 单周期50000步 (等价于CosineAnnealingLR的T_max)
+    restart_weights: [1]  # 无restart
+    eta_min: !!float 1e-5  # 对齐KAIR: 1e-5 而非 1e-7 ⭐⭐⭐⭐
+
+  total_iter: 50000  # 对齐KAIR: 50000 而非 20000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss  # 对齐KAIR: PoissonNLL 而非 Charbonnier ⭐⭐⭐⭐
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-9  # KAIR uses 1e-9
+    max_value: 150.0
+    norm_type: linear
+    # anscombe_inverse not needed for linear
+
+val:
+  val_freq: 1000  # 对齐KAIR: 每5000步验证 (KAIR: checkpoint_test: 5000)
+  save_img: true
+
+  eval_networks: [g, ema]
+  save_img_networks: [ema]  # 只保存EMA的图像
+  pbar: false
+  suffix: ~
+  metric_domain: count
+
+  save_best_ckpt: true
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    enable: true
+    vmax_cnt: 150.0  # 对齐max_value
+    vlim_res: 30.0   # 调整为150的比例
+    vlim_anscombe: 1.0
+
+  metrics:
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 150.0  # 对齐max_value
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 150.0  # 对齐max_value
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    lpips:
+      type: calculate_lpips
+      domain: count
+      better: lower
+      lpips_net: vgg
+      lpips_local_repeat_n: 10
+
+    poisson_fit:
+      type: calculate_poisson_fit
+      domain: count
+      bin_center: nearest_int
+      bin_size: 1.0
+      min_pixels_per_bin: 512
+      min_gt: 0.5
+      better: lower
+
+logger:
+  print_freq: 100  # 对齐KAIR: checkpoint_print: 100
+  save_checkpoint_freq: 1000  # 对齐KAIR: checkpoint_save: 1000
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 10  # 保留更多checkpoint用于分析
+  keep_state_num: 5
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

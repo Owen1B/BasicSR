@@ -1,0 +1,192 @@
+# ============================================================
+# N2N + Restormer (SOTA Transformer架构)
+# CVPR 2022 Oral - SOTA Image Restoration
+# ============================================================
+# 显存估计: ~16GB (4090 24GB 可跑)
+# 参数量: ~26M
+# ============================================================
+
+name: n2n_restormer_baseline
+model_type: SRModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+# =============================================================================
+# Datasets (same as n2n_baseline)
+# =============================================================================
+datasets:
+  train:
+    name: XCAT_train_n2n
+    type: SPECTDatPairedDataset
+    mode: n2n
+
+    # Data paths
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+
+    # View handling
+    posterior_flip: true
+    view_mode: stack2
+
+    # Data split
+    start_idx: 0
+    end_idx: 96
+
+    # N2N binomial splitting
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    # Normalization
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+    # Data augmentation (disabled)
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    # Dataloader
+    use_shuffle: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 16  # Restormer显存较大，减小batch
+    dataset_enlarge_ratio: 4
+    prefetch_mode: ~
+
+  val:
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+
+    # Data paths
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+
+    # View handling
+    posterior_flip: true
+    view_mode: stack2
+
+    # Data split (val: 96-100)
+    start_idx: 96
+    end_idx: 100
+
+    # Normalization
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+# =============================================================================
+# Network - Restormer SOTA
+# =============================================================================
+network_g:
+  type: Restormer
+  inp_channels: 2
+  out_channels: 2
+  dim: 48
+  num_blocks: [4, 6, 6, 8]
+  num_refinement_blocks: 4
+  heads: [1, 2, 4, 8]
+  ffn_expansion_factor: 2.66
+  bias: false
+  LayerNorm_type: BiasFree
+  dual_pixel_task: false
+  global_residual: true
+
+# =============================================================================
+# Training
+# =============================================================================
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: !!float 3e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [50000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  total_iter: 50000
+  warmup_iter: -1
+  use_grad_clip: true
+
+  # Loss - PoissonNLLLoss
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-9
+    max_value: 150.0
+    norm_type: linear
+
+# =============================================================================
+# Validation
+# =============================================================================
+val:
+  val_freq: !!float 2e3
+  save_img: false
+  eval_networks: ['g', 'ema']
+  save_img_networks: ['ema']
+  pbar: false
+  suffix: ~
+
+  metric_domain: count
+  save_best_ckpt: true
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    enable: true
+    vmax_cnt: 150.0
+    vlim_res: 30.0
+    vlim_anscombe: 1.0
+
+  metrics:
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 2e3
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 2
+  keep_state_num: 2
+  wandb:
+    project: spect_selfsup_denoising
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

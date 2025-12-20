@@ -1,4 +1,5 @@
 import logging
+import os
 import torch
 from os import path as osp
 
@@ -11,6 +12,11 @@ from basicsr.utils.options import dict2str, parse_options
 def test_pipeline(root_path):
     # parse options, set distributed setting, set ramdom seed
     opt, _ = parse_options(root_path, is_train=False)
+
+    # If using tqdm pbar in validation, route console logs via tqdm.write() so the progress bar stays at the bottom.
+    # (In SRModel validation, val.pbar controls tqdm usage.)
+    if bool(opt.get('val', {}).get('pbar', False)) and opt.get('rank', 0) == 0:
+        os.environ['BASICSR_TQDM_LOGGING'] = '1'
 
     torch.backends.cudnn.benchmark = True
     # torch.backends.cudnn.deterministic = True

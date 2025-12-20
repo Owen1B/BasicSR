@@ -1,5 +1,6 @@
 import datetime
 import logging
+import os
 import time
 
 from .dist_util import get_dist_info, master_only
@@ -62,6 +63,8 @@ class MessageLogger():
         self.max_iters = opt['train']['total_iter']
         self.use_tb_logger = opt['logger']['use_tb_logger']
         self.tb_logger = tb_logger
+        # Whether to print ETA / iteration timing in INFO logs.
+        self.print_eta = bool(opt.get('logger', {}).get('print_eta', True))
         self.start_time = time.time()
         self.logger = get_root_logger()
 
@@ -91,8 +94,13 @@ class MessageLogger():
             message += f'{v:.3e},'
         message += ')] '
 
+        # Log learning rates to tensorboard
+        if self.use_tb_logger and 'debug' not in self.exp_name:
+            for idx, lr in enumerate(lrs):
+                self.tb_logger.add_scalar(f'learning_rate/lr_{idx}', lr, current_iter)
+
         # time and estimated time
-        if 'time' in log_vars.keys():
+        if self.print_eta and 'time' in log_vars.keys():
             iter_time = log_vars.pop('time')
             data_time = log_vars.pop('data_time')
 
@@ -102,6 +110,10 @@ class MessageLogger():
             eta_str = str(datetime.timedelta(seconds=int(eta_sec)))
             message += f'[eta: {eta_str}, '
             message += f'time (data): {iter_time:.3f} ({data_time:.3f})] '
+        else:
+            # If we are not printing ETA, drop timing keys to avoid polluting the tail log_vars loop.
+            log_vars.pop('time', None)
+            log_vars.pop('data_time', None)
 
         # other items, especially losses
         for k, v in log_vars.items():
@@ -124,7 +136,11 @@ def init_tb_logger(log_dir):
 
 @master_only
 def init_wandb_logger(opt):
-    """We now only use wandb to sync tensorboard log."""
+    """We now only use wandb to sync tensorboard log.
+
+    Returns:
+        str: The wandb run ID for this experiment.
+    """
     import wandb
     logger = get_root_logger()
 
@@ -141,6 +157,11 @@ def init_wandb_logger(opt):
     wandb.init(id=wandb_id, resume=resume, name=opt['name'], config=opt, project=project, sync_tensorboard=True)
 
     logger.info(f'Use wandb logger with id={wandb_id}; project={project}.')
+
+    # Store wandb_id in opt for later use
+    opt['logger']['wandb']['current_id'] = wandb_id
+
+    return wandb_id
 
 
 def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None):
@@ -167,7 +188,25 @@ def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None
         return logger
 
     format_str = '%(asctime)s %(levelname)s: %(message)s'
-    stream_handler = logging.StreamHandler()
+
+    # Make tqdm progress bar stay on the last line by routing logs through tqdm.write().
+    # Enable by setting env BASICSR_TQDM_LOGGING=1 (we set this automatically when train.pbar is enabled).
+    if os.environ.get('BASICSR_TQDM_LOGGING', '0') == '1':
+        from tqdm import tqdm
+
+        class _TqdmLoggingHandler(logging.Handler):
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    tqdm.write(msg)
+                    self.flush()
+                except Exception:
+                    self.handleError(record)
+
+        stream_handler = _TqdmLoggingHandler()
+    else:
+        stream_handler = logging.StreamHandler()
+
     stream_handler.setFormatter(logging.Formatter(format_str))
     logger.addHandler(stream_handler)
     logger.propagate = False

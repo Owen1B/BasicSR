@@ -143,7 +143,8 @@ def parse_options(root_path, is_train=True):
             # using exec function
             exec(eval_str)
 
-    opt['auto_resume'] = args.auto_resume
+    # auto_resume: command line argument takes priority, otherwise use config value
+    opt['auto_resume'] = args.auto_resume if args.auto_resume else opt.get('auto_resume', False)
     opt['is_train'] = is_train
 
     # debug setting

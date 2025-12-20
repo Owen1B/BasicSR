@@ -251,3 +251,89 @@ class PerceptualLoss(nn.Module):
         features_t = features.transpose(1, 2)
         gram = features.bmm(features_t) / (c * h * w)
         return gram
+
+
+@LOSS_REGISTRY.register()
+class GradientLoss(nn.Module):
+    """Gradient Loss for edge preservation.
+
+    Computes the L1 loss between gradients of predicted and reference images.
+    For Noise2Noise training, can use input (lq) as reference instead of noisy GT.
+
+    Args:
+        loss_weight (float): Loss weight. Default: 1.0.
+        reduction (str): Specifies the reduction to apply to the output.
+            Supported choices are 'mean' | 'sum'. Default: 'mean'.
+        use_input_as_ref (bool): If True, use input (lq) as reference instead of target (gt).
+            Recommended for Noise2Noise training where GT is also noisy.
+            Default: False (use target as reference).
+    """
+
+    def __init__(self, loss_weight=1.0, reduction='mean', use_input_as_ref=False):
+        super(GradientLoss, self).__init__()
+        if reduction not in ['mean', 'sum']:
+            raise ValueError(f'Unsupported reduction mode: {reduction}. Supported ones are: mean | sum')
+
+        self.loss_weight = loss_weight
+        self.reduction = reduction
+        self.use_input_as_ref = use_input_as_ref
+
+    def compute_gradient(self, img):
+        """Compute image gradients in x and y directions.
+
+        Args:
+            img (Tensor): Input image tensor of shape (N, C, H, W).
+
+        Returns:
+            Tensor: Gradient magnitude of shape (N, C, H, W).
+        """
+        # Sobel filters for gradient computation
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                               dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                               dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+
+        # Apply filters to each channel
+        grad_x = F.conv2d(img, sobel_x.repeat(img.size(1), 1, 1, 1),
+                         padding=1, groups=img.size(1))
+        grad_y = F.conv2d(img, sobel_y.repeat(img.size(1), 1, 1, 1),
+                         padding=1, groups=img.size(1))
+
+        # Compute gradient magnitude
+        grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+        return grad_mag
+
+    def forward(self, pred, target=None, input_ref=None):
+        """Forward function.
+
+        Args:
+            pred (Tensor): Predicted tensor of shape (N, C, H, W).
+            target (Tensor, optional): Ground-truth tensor of shape (N, C, H, W).
+                Used when use_input_as_ref=False.
+            input_ref (Tensor, optional): Input (lq) tensor of shape (N, C, H, W).
+                Used when use_input_as_ref=True. Recommended for N2N training.
+
+        Returns:
+            Tensor: Gradient loss.
+        """
+        pred_grad = self.compute_gradient(pred)
+
+        # Choose reference based on use_input_as_ref flag
+        if self.use_input_as_ref:
+            if input_ref is None:
+                raise ValueError("use_input_as_ref=True requires input_ref to be provided")
+            ref_grad = self.compute_gradient(input_ref)
+        else:
+            if target is None:
+                raise ValueError("use_input_as_ref=False requires target to be provided")
+            ref_grad = self.compute_gradient(target)
+
+        # Compute L1 loss between gradients
+        loss = F.l1_loss(pred_grad, ref_grad, reduction='none')
+
+        if self.reduction == 'mean':
+            loss = loss.mean()
+        elif self.reduction == 'sum':
+            loss = loss.sum()
+
+        return self.loss_weight * loss

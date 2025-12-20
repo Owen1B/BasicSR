@@ -1,0 +1,145 @@
+# Bone (real) single-view N2N config with TV Regularization
+# Based on: n2n_bone_proj_20s_singleview_sota.yml
+# Added: TV regularization to improve background denoising
+
+name: n2n_bone_proj_20s_singleview_sota_tv
+model_type: SPECT3DModel  # Use SPECT3DModel for automatic GIF generation during validation
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: Bone_train_n2n_single
+    type: SPECTDatPairedDataset
+    mode: n2n
+    dataroot_gt: datasets/bone_projection_20s_dat
+    height: 128
+    width: 128
+
+    # single-view samples (H,W,1)
+    view_mode: split1
+    view_select: both
+    posterior_flip: false
+
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    # For bone data, max counts are sparse; you can tune this (60/100/150).
+    max_value: 100.0
+    clip_max_value: false
+    norm:
+      type: linear
+
+    # SOTA-like patch/batch
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    start_idx: 0
+    end_idx: 810
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 16
+    dataset_enlarge_ratio: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: null
+
+  # Validation dataset (must be in datasets section for create_train_val_dataloader)
+  val:
+    name: Bone_val_projection
+    type: SPECTProjectionDataset  # Direct loading of raw projection files
+    dataroot: datasets/bone_20230327  # Root directory for projection files
+    pattern: "**/20s-1/ProjectionImage1.dat"  # Glob pattern to find projection files
+    height: 128
+    width: 128
+    views: 60
+
+    start_idx: 0
+    end_idx: 3  # Use first 3 projection files for validation
+
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+    # Enable GIF generation for 3D data
+    generate_gif: true
+    gif_output_dir: experiments/{name}/visualization/gifs
+    max_gifs_per_val: 3  # Limit number of GIFs per validation
+
+    # No metrics for real data without clean GT
+    metrics: null
+
+network_g:
+  type: UNetRes
+  in_nc: 1
+  out_nc: 1
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: 0.0001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000]
+    restart_weights: [1]
+    eta_min: 1.0e-05
+
+  total_iter: 100000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-09
+    max_value: 100.0
+    norm_type: linear
+
+  # TV Regularization: encourages smoothness, helps with background denoising
+  tv_opt:
+    type: WeightedTVLoss
+    loss_weight: 0.01  # Start with small weight, can tune (0.001-0.1)
+    reduction: mean
+
+# Validation configuration (val_freq and other settings)
+# Note: Validation dataset is defined in datasets.val above
+val:
+  val_freq: 1000  # Validate every 1000 iterations (same as checkpoint save frequency)
+  save_img: false  # We generate GIFs instead of saving individual images
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 2
+  keep_state_num: 2
+  wandb: null
+
+dist_params:
+  backend: nccl
+  port: 29500
+
+auto_resume: true
+

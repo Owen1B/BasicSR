@@ -1,0 +1,267 @@
+# XCAT SPECT planar denoising (Noise2Noise / N2N) using DRUNet-style residual U-Net backbone.
+#
+# High-level idea
+# - Train (N2N): use ONLY one directory with Poisson 1x count images.
+#   For each patch, do per-pixel binomial thinning to split a single count image into TWO independent
+#   2x "half-dose" realizations (A and B), and train the network to map one -> the other.
+# - Val (paired): use paired Poisson (LQ) vs Ideal (GT) to report metrics (in count domain) and save grids.
+#
+# Notes
+# - This repo's SPECT dataset returns normalized tensors to the network, but metrics/visualization can inverse
+#   back to count domain via Dataset.inverse_from_norm().
+# - YAML supports comments with '#'. They do not affect parsing.
+
+# Experiment name. If it contains "debug", BasicSR enters debug mode (more frequent logs, disables remote loggers).
+name: spect_xcat_poisson_drunet_n2n_anscombe
+
+# Training model wrapper. SRModel is used here as a generic "image-to-image" trainer (scale=1 => denoising).
+model_type: SRModel
+scale: 1
+
+# GPU / randomness.
+num_gpu: 1
+manual_seed: 0
+
+datasets:
+  train:
+    # ---------------------------
+    # Train dataset (N2N mode)
+    # ---------------------------
+    name: XCAT_train_n2n
+    type: SPECTDatPairedDataset
+    mode: n2n
+    # In n2n mode, only dataroot_gt is used (single directory).
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+
+    # How to present the 2-view planar image:
+    # - stack2: one sample has 2 channels (anterior + flipped-posterior) => network in/out channels = 2
+    view_mode: stack2
+    # Dataset split (0-based, end_idx is exclusive).
+    # Train: first 96 samples -> [0, 96)
+    start_idx: 0
+    end_idx: 96
+
+    # N2N binomial split config (ONLINE, and applied AFTER crop/augment on the patch):
+    # Given a patch with integer-ish counts N (per pixel), sample:
+    #   A ~ Binomial(N, p)
+    #   B = N - A
+    # Then choose (input, target) as (A, B) or (B, A).
+    n2n_p: 0.5
+    # If true, randomly swap A/B each sample to make training symmetric.
+    # If false, always use the fixed direction (A->B).
+    n2n_random_swap: false
+    # How to bin counts before splitting (important if source is float counts):
+    # - nearest: round to nearest integer (floor(x+0.5))
+    # - floor:   floor(x)
+    n2n_round: nearest   # nearest | floor
+
+    # Optional GT scale factor (kept 1.0 here). In paired/poisson modes, can be used to match dose scale.
+    gt_scale_factor: 1.0
+
+    # Global max value used for normalization/inverse (count domain upper bound for this dataset).
+    max_value: 100.0
+    norm:
+      # Normalization domain used for training loss.
+      # - anscombe: apply Anscombe VST first, then scale to [0,1] by dividing by A(max_value).
+      #             This makes Poisson noise closer to homoscedastic Gaussian.
+      type: anscombe
+      # Inverse used when converting network output back to count domain for metrics/visualization.
+      inverse: unbiased
+
+    # Patch training.
+    # - gt_size: patch size (int). Set to '~' to train on full images (very heavy for 1024x256).
+    gt_size: 256
+
+    # Data augmentation. For medical images default is conservative (off).
+    use_hflip: false
+    use_rot: false
+
+    # DataLoader settings.
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 8
+    # EnlargedSampler ratio: effectively makes "one epoch" longer by sampling with random repetition.
+    # Usually keep 1 unless you specifically want longer epochs.
+    dataset_enlarge_ratio: 1
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: ~
+
+  val:
+    # ---------------------------
+    # Validation dataset (paired)
+    # ---------------------------
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_mode: stack2
+    # Dataset split (0-based, end_idx is exclusive).
+    # Val: last 4 samples -> [96, 100)
+    start_idx: 96
+    end_idx: 100
+
+    gt_scale_factor: 1.0
+    max_value: 100.0
+    norm:
+      type: anscombe
+      inverse: unbiased
+
+network_g:
+  # Generator network. UNetRes is the DRUNet-style residual U-Net implemented in basicsr/archs/drunet_arch.py
+  type: UNetRes
+  # 2-channel input (anterior/posterior) and 2-channel output (denoised anterior/posterior).
+  in_nc: 2
+  out_nc: 2
+  # Channel widths per scale and number of residual blocks per stage.
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  # bias=false is commonly used with normalization-free residual blocks in this repo.
+  bias: false
+  # Global residual: output = input + f(input). Helpful for denoising (keeps zero regions near zero).
+  global_residual: true
+
+path:
+  # Pretrain/resume.
+  # - pretrain_network_g: load weights for net_g (and net_g_ema if params_ema exists).
+  # - resume_state: resume optimizer/scheduler + iter/epoch from training_states/*.state
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  # EMA (Exponential Moving Average) for more stable eval/saving.
+  ema_decay: 0.999
+
+  # Progress bar for training loop (tqdm). Also enables tqdm-friendly logging.
+  pbar: true
+
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    # One-cycle cosine decay over total_iter.
+    type: CosineAnnealingRestartLR
+    periods: [20000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+
+  # Total training iterations (steps), NOT epochs.
+  total_iter: 20000
+  warmup_iter: -1
+
+  pixel_opt:
+    # Training loss in the chosen norm domain (here: Anscombe domain).
+    type: CharbonnierLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-12
+
+val:
+  # Validation frequency (in iters).
+  val_freq: 200
+
+  # Save standard output images (and SPECT grids if spect_vis.enable=true).
+  save_img: true
+
+  # Evaluate both raw G and EMA to compare performance.
+  eval_networks: [g, ema]
+  # Save images for both networks (disk heavier).
+  save_img_networks: [g, ema]
+  pbar: false
+  suffix: ~
+  # Default metric domain:
+  # - norm: metrics computed on normalized images (uint8 conversion)
+  # - count: metrics computed after inverse_from_norm() back to count domain
+  metric_domain: count
+
+  # Save best checkpoint based on chosen metric (overwrites net_g_best.pth)
+  save_best_ckpt: true
+  # Best metric to monitor (defaults to first metric + first eval network if omitted)
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    # SPECT-specific grid visualization (count-domain, 2-view). Saved into experiments/.../visualization/...
+    enable: true
+    # Display max for count images (vmax for imshow); does NOT clamp model outputs.
+    vmax_cnt: 100.0
+    # Residual display limits (symmetric +/- vlim). Used for noise/residual panels.
+    vlim_res: 20.0
+    # Anscombe-domain residual display limit (symmetric).
+    vlim_anscombe: 1.0
+
+  metrics:
+    # Metrics are computed per evaluated network (g/ema) and logged with suffix: <metric>_<tag>
+    # Example keys in logs/tb: psnr_cnt_g, psnr_cnt_ema, poisson_fit_g, poisson_fit_ema, ...
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 100.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 100.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    lpips:
+      # LPIPS is computed on [0,1] images; SRModel rescales count-domain images by data_range internally.
+      type: calculate_lpips
+      domain: count
+      better: lower
+      lpips_net: vgg
+      lpips_local_repeat_n: 10
+
+    poisson_fit:
+      # Custom metric: GT-binned Poisson conformity.
+      # It bins pixels by GT intensity (nearest integer bins by default), then compares Var(noise) vs Mean(GT) per bin.
+      # Lower is better (closer to Poisson: var ~= mean).
+      type: calculate_poisson_fit
+      domain: count
+      bin_center: nearest_int
+      bin_size: 1.0
+      min_pixels_per_bin: 512
+      min_gt: 0.5
+      better: lower
+
+logger:
+  # Logging/ckpt settings.
+  print_freq: 10
+  # Save checkpoints every N iters (creates net_g_<iter>.pth and <iter>.state).
+  save_checkpoint_freq: 200
+  use_tb_logger: true
+  # Do not print ETA/time/data_time in INFO logs (cleaner with tqdm).
+  print_eta: false
+  # Keep only the most recent N checkpoints (saves disk space).
+  # Special checkpoints like "latest" and "best" are never deleted.
+  keep_ckpt_num: 5
+  # Keep only the most recent N training states (.state files).
+  # If not specified, defaults to keep_ckpt_num value.
+  keep_state_num: 5
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  # Distributed training settings (ignored for num_gpu=1 / non-dist).
+  backend: nccl
+  port: 29500
+
+

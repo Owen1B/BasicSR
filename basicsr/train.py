@@ -1,9 +1,11 @@
 import datetime
 import logging
 import math
+import os
 import time
 import torch
 from os import path as osp
+from tqdm import tqdm
 
 from basicsr.data import build_dataloader, build_dataset
 from basicsr.data.data_sampler import EnlargedSampler
@@ -42,8 +44,9 @@ def create_train_val_dataloader(opt, logger):
                 sampler=train_sampler,
                 seed=opt['manual_seed'])
 
-            num_iter_per_epoch = math.ceil(
-                len(train_set) * dataset_enlarge_ratio / (dataset_opt['batch_size_per_gpu'] * opt['world_size']))
+            # Calculate iterations per epoch considering drop_last=True in build_dataloader
+            # When drop_last=True, the last incomplete batch is dropped, so we use floor division
+            num_iter_per_epoch = (len(train_set) * dataset_enlarge_ratio) // (dataset_opt['batch_size_per_gpu'] * opt['world_size'])
             total_iters = int(opt['train']['total_iter'])
             total_epochs = math.ceil(total_iters / (num_iter_per_epoch))
             logger.info('Training statistics:'
@@ -85,6 +88,15 @@ def load_resume_state(opt):
         device_id = torch.cuda.current_device()
         resume_state = torch.load(resume_state_path, map_location=lambda storage, loc: storage.cuda(device_id))
         check_resume(opt, resume_state['iter'])
+
+        # Extract wandb_id from resume state and put it in opt for wandb resume
+        if 'wandb_id' in resume_state:
+            if 'logger' not in opt:
+                opt['logger'] = {}
+            if 'wandb' not in opt['logger']:
+                opt['logger']['wandb'] = {}
+            opt['logger']['wandb']['resume_id'] = resume_state['wandb_id']
+
     return resume_state
 
 
@@ -92,6 +104,10 @@ def train_pipeline(root_path):
     # parse options, set distributed setting, set random seed
     opt, args = parse_options(root_path, is_train=True)
     opt['root_path'] = root_path
+
+    # If using tqdm pbar, route console logs via tqdm.write() so the progress bar stays at the bottom.
+    if bool(opt.get('train', {}).get('pbar', False)) and opt.get('rank', 0) == 0:
+        os.environ['BASICSR_TQDM_LOGGING'] = '1'
 
     torch.backends.cudnn.benchmark = True
     # torch.backends.cudnn.deterministic = True
@@ -150,6 +166,16 @@ def train_pipeline(root_path):
     logger.info(f'Start training from epoch: {start_epoch}, iter: {current_iter}')
     data_timer, iter_timer = AvgTimer(), AvgTimer()
     start_time = time.time()
+    use_train_pbar = bool(opt.get('train', {}).get('pbar', False)) and opt['rank'] == 0
+    train_pbar = None
+    if use_train_pbar:
+        train_pbar = tqdm(
+            total=int(total_iters),
+            initial=int(current_iter),
+            unit='iter',
+            dynamic_ncols=True,
+            desc='Train',
+        )
 
     for epoch in range(start_epoch, total_epochs + 1):
         train_sampler.set_epoch(epoch)
@@ -168,6 +194,23 @@ def train_pipeline(root_path):
             model.feed_data(train_data)
             model.optimize_parameters(current_iter)
             iter_timer.record()
+            if train_pbar is not None:
+                # Keep tqdm postfix lightweight to avoid slowing down training
+                post = {'epoch': epoch}
+                try:
+                    log_dict = model.get_current_log()
+                    if isinstance(log_dict, dict) and 'l_pix' in log_dict:
+                        post['l_pix'] = float(log_dict['l_pix'])
+                except Exception:
+                    pass
+                try:
+                    lrs = model.get_current_learning_rate()
+                    if isinstance(lrs, (list, tuple)) and len(lrs) > 0:
+                        post['lr'] = float(lrs[0])
+                except Exception:
+                    pass
+                train_pbar.set_postfix(post)
+                train_pbar.update(1)
             if current_iter == 1:
                 # reset start time in msg_logger for more accurate eta_time
                 # not work in resume mode
@@ -198,6 +241,8 @@ def train_pipeline(root_path):
         # end of iter
 
     # end of epoch
+    if train_pbar is not None:
+        train_pbar.close()
 
     consumed_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
     logger.info(f'End of training. Time consumed: {consumed_time}')

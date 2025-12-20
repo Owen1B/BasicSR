@@ -1,0 +1,178 @@
+# =============================================================================
+# N2N with FPN Fusion Configuration
+# =============================================================================
+# N2N baseline but with FPN-style multi-scale feature fusion network.
+#
+# Key differences from N2N baseline:
+# - Uses UNetFPNFusion network (FPN-style dual-view fusion)
+# - Separate encoders for each view with multi-scale feature fusion
+# =============================================================================
+
+name: n2n_fpn_fusion
+model_type: SRModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+# =============================================================================
+# Datasets (same as N2N baseline)
+# =============================================================================
+datasets:
+  train:
+    name: XCAT_train_n2n
+    type: SPECTDatPairedDataset
+    mode: n2n
+
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+
+    posterior_flip: true
+    view_mode: stack2
+
+    start_idx: 0
+    end_idx: 96
+
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 32
+    dataset_enlarge_ratio: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: null
+
+  val:
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+
+    posterior_flip: true
+    view_mode: stack2
+
+    start_idx: 96
+    end_idx: 100
+
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+# =============================================================================
+# Network Architecture (FPN-style Fusion)
+# =============================================================================
+network_g:
+  type: UNetFPNFusion
+  in_nc: 2           # Dual-view input
+  out_nc: 2          # Dual-view output
+  base_ch: 64        # Base channels (same as UNetRes)
+  num_levels: 4      # Encoder/decoder levels
+  num_res_blocks: 2  # Residual blocks per level
+  use_bn: true       # Use batch normalization
+  global_residual: true
+
+# =============================================================================
+# Training Configuration (same as N2N baseline)
+# =============================================================================
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [50000]
+    restart_weights: [1]
+    eta_min: 1.0e-5
+
+  total_iter: 50000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-9
+    max_value: 150.0
+    norm_type: linear
+
+# =============================================================================
+# Validation Configuration
+# =============================================================================
+val:
+  val_freq: 1000
+  save_img: false
+  eval_networks: [g, ema]
+  save_img_networks: [ema]
+  pbar: false
+  suffix: null
+  metric_domain: count
+  save_best_ckpt: true
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    enable: true
+    vmax_cnt: 150.0
+    vlim_res: 30.0
+    vlim_anscombe: 1.0
+
+  metrics:
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+# =============================================================================
+# Logging
+# =============================================================================
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 2
+  keep_state_num: 2
+  wandb:
+    project: spect_selfsup_denoising
+    resume_id: null
+
+dist_params:
+  backend: nccl
+  port: 29500
+
