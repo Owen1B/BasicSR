@@ -178,15 +178,16 @@ def main():
     subdir = output_dir / exp_name / sample_name
     subdir.mkdir(parents=True, exist_ok=True)
 
-    # Save as uint16 (same format as original)
-    denoised_u16 = np.clip(denoised, 0, 65535).astype(np.uint16)
+    # Save as int16 (same format as original)
+    # 四舍五入后转换为 int16
+    denoised_i16 = np.round(denoised).astype(np.int16)
     output_file = subdir / f"ProjectionImage1_denoised_{checkpoint_name}.dat"
-    denoised_u16.tofile(str(output_file))
+    denoised_i16.tofile(str(output_file))
 
     print(f"✅ Saved denoised projection to: {output_file}")
     print(f"📊 File size: {output_file.stat().st_size / 1024 / 1024:.2f} MB")
-    print(f"📊 Shape: {denoised_u16.shape}, dtype: {denoised_u16.dtype}")
-    print(f"📊 Value range: [{denoised_u16.min()}, {denoised_u16.max()}]")
+    print(f"📊 Shape: {denoised_i16.shape}, dtype: {denoised_i16.dtype}")
+    print(f"📊 Value range: [{denoised_i16.min()}, {denoised_i16.max()}]")
 
     # Also save a summary text file
     summary_file = subdir / f"ProjectionImage1_denoised_{checkpoint_name}.txt"
@@ -208,10 +209,10 @@ def main():
         f.write(f"  Std: {proj_u16.std():.2f}\n")
         f.write(f"\n")
         f.write(f"Denoised projection:\n")
-        f.write(f"  Shape: {denoised_u16.shape}\n")
-        f.write(f"  Range: [{denoised_u16.min()}, {denoised_u16.max()}]\n")
-        f.write(f"  Mean: {denoised_u16.mean():.2f}\n")
-        f.write(f"  Std: {denoised_u16.std():.2f}\n")
+        f.write(f"  Shape: {denoised_i16.shape}\n")
+        f.write(f"  Range: [{denoised_i16.min()}, {denoised_i16.max()}]\n")
+        f.write(f"  Mean: {denoised_i16.mean():.2f}\n")
+        f.write(f"  Std: {denoised_i16.std():.2f}\n")
         f.write(f"\n")
         f.write(f"Output file: {output_file}\n")
 

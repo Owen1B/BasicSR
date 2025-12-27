@@ -1,0 +1,56 @@
+[Projection Parameters]
+ProjectionFileName=ProjectionImage1_denoised.dat;
+Scatter_Prj_Est_File=;
+PrjXDimSize=128;
+PrjZDimSize=128;
+NumOfPrjViews=60;
+NumofGates=1;
+PrjDataType=2;
+PrjDataOffSet=0;
+PrjBinSize=4.400000095;
+PrjSliceThickness=4.400000095;
+PreCorretPrj?=1;// apply precorrection to projection if true, 0 recommended for new user
+PrjXShift=0;// the X-direction shift of projection data relative to center of rotation
+PrjZShift=0;// the Z-direction shift of projection data relative to center of rotation
+PrjPlaneXAngleTilt=0;//careful,this option may be removed in the future
+PrjPlaneZAngleTilt=0;//careful,this option may be removed in the future
+AngleRangeOfSimpleOrbit=360.00;
+StartAngleOfSimpleOrbit=-180.00;
+ColFace_To_CenterOfFOV=135.07;
+UseComplexOrbit=1;
+CpOrbitDescSize=7; // only needed when 
+CpOrbitFileName=orbit.orb;
+
+[Reconstruction Parameters]
+OutputImageFileName=ZhaoMeiLan_denoised_OSEMReconed_Iter30.dat;
+OutputDataOffset=0;
+;InitEst_Image_File_Name=./dummy.raw; //File name of input initial image estimation (optional)
+Image_Pixel_Width=4.400000095;
+Image_Pixel_Height=4.400000095;
+Iterations=30;
+Number_of_Views_Per_Subset=15;
+System_Model=4;
+//Beta_s=0;
+//Beta_t=10000;  // default: 10000
+//PatchSizeX=3;
+//PatchSizeY=3;
+//PatchSizeZ=3;
+MaxLORNum=20000000;
+Use4DFilter=0;
+Filter4DSize=5;
+FWHM4D=2.0;
+H_s=3.0;
+H_t=1.3;
+
+[Attenuation Correction Parameters]
+AtnMap_File_Name=PostAtten.dat;
+AtnMap_Data_Header_OffSet=0;
+
+[Collimator Modeling Parameters]
+Gap=3.00;
+Collimator_Hole_Length=35.00;
+Collimator_Hole_Diameter=1.50;
+Intrinsic_FWHM=3.7;// FHWM of Detector intrinsic spatial resolution
+Read_Drf_From_File?=0;//read drf table from file if true(1)
+Drf_Table_File1=DrfPara.par;//the drf table file name
+Drf_FFT_Convolve=0;//if true convolve Drf table in Fourier domain
