@@ -46,16 +46,21 @@ class SPECT3DModel(SRModel):
         Detect if the data is 3D (e.g., projection sequence).
 
         Heuristics:
-        - Filename contains "ProjectionImage" (raw projection file)
+        - Filename contains "ProjectionImage" or "Proj4Filter" (raw projection file)
         - Dataset type is SPECTProjectionDataset (designed for 3D data)
         """
         path_lower = lq_path.lower()
         # Check filename patterns (raw projection files)
         if 'projectionimage' in path_lower:
             return True
-        # Check dataset type
+        if 'proj4filter' in path_lower:
+            return True
+        # Check dataset type from both val and datasets.val
         val_opt = self.opt.get('val', {})
+        datasets_val_opt = self.opt.get('datasets', {}).get('val', {})
         if val_opt.get('type') == 'SPECTProjectionDataset':
+            return True
+        if datasets_val_opt.get('type') == 'SPECTProjectionDataset':
             return True
         return False
 
@@ -145,11 +150,14 @@ class SPECT3DModel(SRModel):
         output_path: str,
         current_iter: int,
         net_tag: str = 'ema',
+        tb_logger=None,
+        val_opt: Optional[Dict] = None,
+        poisson_calib_ctx: Optional[Dict] = None,
     ) -> Optional[str]:
         """
         Generate a 6-view GIF for 3D projection data validation.
 
-        Views: Original | BM3D | Denoised(g) | Denoised(ema) | Residual | Residual Anscombe
+        Views: Original | BM3D | Denoised(g) | Denoised(ema) | Poisson Sample | Residual | Residual Anscombe
 
         Args:
             val_data: Validation data dict containing 'lq' tensor and 'lq_path'
@@ -165,6 +173,19 @@ class SPECT3DModel(SRModel):
             import matplotlib
             matplotlib.use('Agg')
             import matplotlib.cm as cm
+
+            # Merge validation options (top-level val + datasets.val) if not provided by caller
+            if val_opt is None:
+                _val_opt = self.opt.get('val', {}) or {}
+                _datasets_val_opt = self.opt.get('datasets', {}).get('val', {}) or {}
+                val_opt = {**_val_opt, **_datasets_val_opt}
+
+            # NOTE: For GIF inference, ALWAYS feed the network with the same normalization as training:
+            # use a fixed max_value (e.g. 150.0). This keeps the input distribution consistent and avoids
+            # scale-induced artifacts because the network is not strictly scale-invariant.
+            #
+            # Separately, for GIF DISPLAY (mapping to uint8), we can use a per-patient global max to avoid
+            # "too flat/too gray" GIFs while staying stable across views.
 
             # Get projection data from validation data
             # For SPECTProjectionDataset, lq_path points directly to ProjectionImage*.dat
@@ -210,6 +231,18 @@ class SPECT3DModel(SRModel):
             network_g_opt = self.opt.get('network_g', {})
             network_in_nc = network_g_opt.get('in_nc', 1)
             use_noise_map = (network_in_nc == 2)  # Use noise map if network expects 2 channels
+            # Detect if current network is a 3D conv model (expects volume input [1,C,60,128,128])
+            # Heuristic: any Conv3d exists in net_g.
+            def _is_3d_net(net: torch.nn.Module) -> bool:
+                try:
+                    for m in net.modules():
+                        if isinstance(m, torch.nn.Conv3d) or isinstance(m, torch.nn.ConvTranspose3d):
+                            return True
+                except Exception:
+                    pass
+                return False
+
+            is_3d_net_g = _is_3d_net(self.net_g)
 
             # Get noise map settings from config (if using noise map)
             train_opt = self.opt.get('datasets', {}).get('train', {})
@@ -220,28 +253,27 @@ class SPECT3DModel(SRModel):
                 use_global_noise_map = False
                 noise_map_eps = 1e-6
 
+            # --- Inference normalization (fixed max_value, training-style) ---
+            ds_train_opt = (self.opt.get('datasets', {}) or {}).get('train', {}) or {}
+            max_value_train = float((val_opt or {}).get('max_value', ds_train_opt.get('max_value', 150.0)))
+            if max_value_train < 1e-6:
+                max_value_train = 1.0
+            vmax_arr = np.full((int(proj_u16.shape[0]),), max_value_train, dtype=np.float32)
+
+            # --- Display scaling for GIF (per-patient global max from ORIGINAL projection) ---
+            # This is ONLY used for mapping frames to uint8 for visualization (normalize_to_u8),
+            # not for network input.
+            vmax_display = float(np.max(proj_u16))
+            if vmax_display < 1e-6:
+                vmax_display = 1.0
+
             # Load or compute BM3D denoising (with caching)
             # Use lq_path for cache key
             exp_name = self.opt.get('name', 'unknown')
             cache_dir = Path('experiments') / exp_name / 'cache' / 'bm3d'
             denoised_bm3d = self._load_or_compute_bm3d(proj_u16, cache_dir, lq_path)
 
-            # Extract step number from current_iter
-            # Handle both int and string (from test.py, current_iter might be experiment name)
-            if isinstance(current_iter, (int, float)):
-                step_str = f"{int(current_iter):,}"
-            else:
-                # If current_iter is a string (e.g., experiment name), try to extract number or use as-is
-                try:
-                    # Try to extract number from string (e.g., "1000" or "iter1000")
-                    import re
-                    match = re.search(r'\d+', str(current_iter))
-                    if match:
-                        step_str = f"{int(match.group()):,}"
-                    else:
-                        step_str = str(current_iter)
-                except:
-                    step_str = str(current_iter)
+            # Step number extraction removed - no longer used in GIF labels
 
             # Helper function to compute noise map (same as dataset)
             # Only used when use_noise_map=True (network expects 2 channels)
@@ -257,77 +289,148 @@ class SPECT3DModel(SRModel):
                     # Per-pixel noise map: 1/√pixel_value
                     return 1.0 / np.sqrt(np.maximum(img, noise_map_eps))
 
-            # Denoise all views (single-channel or 2-channel input based on network config)
+            # Denoise all views (2D per-view inference) OR denoise full volume (3D inference)
             device = next(self.net_g.parameters()).device
 
-            # 分别推理 g 和 ema
-            self.net_g.eval()
-            denoised_g = np.zeros_like(proj_u16, dtype=np.float32)
+            def _denoise_2d_per_view(net: torch.nn.Module) -> np.ndarray:
+                net.eval()
+                out = np.zeros_like(proj_u16, dtype=np.float32)
+                with torch.no_grad():
+                    for i in range(proj_u16.shape[0]):
+                        proj_i = proj_u16[i].astype(np.float32, copy=False)
+                        vmax_i = float(vmax_arr[i])
+                        proj_normalized = proj_i / vmax_i
+                        if use_noise_map:
+                            noise_map = compute_noise_map(proj_i, vmax_i)
+                            input_data = np.stack([proj_normalized, noise_map], axis=-1)  # (H, W, 2)
+                            xt = torch.from_numpy(input_data.transpose(2, 0, 1)[None, ...]).to(device=device, dtype=torch.float32)
+                        else:
+                            xt = torch.from_numpy(proj_normalized[None, None, ...]).to(device=device, dtype=torch.float32)
+                        yt = net(xt)
+                        yt = torch.clamp(yt, min=0.0)
+                        y = yt.squeeze(0).squeeze(0).detach().cpu().numpy()
+                        out[i] = y * vmax_i
+                return out
 
-            with torch.no_grad():
-                for i in range(proj_u16.shape[0]):
-                    # Per-angle normalization
-                    proj_i = proj_u16[i].astype(np.float32, copy=False)
-                    vmax_i = float(np.max(proj_i))
-                    if vmax_i < 1e-6:
-                        vmax_i = 1.0
-
-                    # Normalize projection
-                    proj_normalized = proj_i / vmax_i
-
-                    # Prepare input based on network configuration
-                    if use_noise_map:
-                        # Compute noise map
-                        noise_map = compute_noise_map(proj_i, vmax_i)
-                        # Concatenate: [normalized_projection, noise_map] -> (H, W, 2)
-                        input_data = np.stack([proj_normalized, noise_map], axis=-1)  # (H, W, 2)
-                        # Convert to tensor: HWC -> CHW -> (1, 2, H, W)
-                        xt = torch.from_numpy(input_data.transpose(2, 0, 1)[None, ...]).to(device=device, dtype=torch.float32)
-                    else:
-                        # Single-channel input: (H, W) -> (1, 1, H, W)
-                        xt = torch.from_numpy(proj_normalized[None, None, ...]).to(device=device, dtype=torch.float32)
-
-                    # Forward pass
-                    yt = self.net_g(xt)
+            def _denoise_3d_volume(net: torch.nn.Module) -> np.ndarray:
+                """Denoise full (60,128,128) volume with one forward."""
+                if use_noise_map:
+                    raise NotImplementedError("3D net + noise_map (in_nc==2) is not supported in GIF inference.")
+                net.eval()
+                # Normalize with the selected gif_norm_mode (vmax_arr is (60,))
+                x_norm = (proj_u16 / vmax_arr[:, None, None]).astype(np.float32, copy=False)  # (60,H,W)
+                xt = torch.from_numpy(x_norm[None, None, ...]).to(device=device, dtype=torch.float32)  # (1,1,60,H,W)
+                with torch.no_grad():
+                    yt = net(xt)
                     yt = torch.clamp(yt, min=0.0)
-                    y = yt.squeeze(0).squeeze(0).detach().cpu().numpy()  # (H, W)
-                    denoised_g[i] = y * vmax_i  # Denormalize
+                y_norm = yt.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (60,H,W)
+                out = y_norm * vmax_arr[:, None, None]
+                return out.astype(np.float32, copy=False)
+
+            # g / ema inference
+            denoised_g = _denoise_3d_volume(self.net_g) if is_3d_net_g else _denoise_2d_per_view(self.net_g)
 
             # 推理 ema（如果存在）
             if hasattr(self, 'net_g_ema'):
-                self.net_g_ema.eval()
-                denoised_ema = np.zeros_like(proj_u16, dtype=np.float32)
-                with torch.no_grad():
-                    for i in range(proj_u16.shape[0]):
-                        # Per-angle normalization
-                        proj_i = proj_u16[i].astype(np.float32, copy=False)
-                        vmax_i = float(np.max(proj_i))
-                        if vmax_i < 1e-6:
-                            vmax_i = 1.0
-
-                        # Normalize projection
-                        proj_normalized = proj_i / vmax_i
-
-                        # Prepare input based on network configuration
-                        if use_noise_map:
-                            # Compute noise map
-                            noise_map = compute_noise_map(proj_i, vmax_i)
-                            # Concatenate: [normalized_projection, noise_map] -> (H, W, 2)
-                            input_data = np.stack([proj_normalized, noise_map], axis=-1)  # (H, W, 2)
-                            # Convert to tensor: HWC -> CHW -> (1, 2, H, W)
-                            xt = torch.from_numpy(input_data.transpose(2, 0, 1)[None, ...]).to(device=device, dtype=torch.float32)
-                        else:
-                            # Single-channel input: (H, W) -> (1, 1, H, W)
-                            xt = torch.from_numpy(proj_normalized[None, None, ...]).to(device=device, dtype=torch.float32)
-
-                        # Forward pass
-                        yt = self.net_g_ema(xt)
-                        yt = torch.clamp(yt, min=0.0)
-                        y = yt.squeeze(0).squeeze(0).detach().cpu().numpy()  # (H, W)
-                        denoised_ema[i] = y * vmax_i  # Denormalize
+                is_3d_net_ema = _is_3d_net(self.net_g_ema)
+                denoised_ema = _denoise_3d_volume(self.net_g_ema) if is_3d_net_ema else _denoise_2d_per_view(self.net_g_ema)
             else:
                 # 如果没有 EMA，使用 g 的结果
                 denoised_ema = denoised_g.copy()
+
+            # Generate Poisson sample from denoised_ema (for 5th column)
+            def poisson_sample(img_count):
+                """Generate Poisson sample from count image.
+
+                Args:
+                    img_count: Count domain image, np.float32
+
+                Returns:
+                    Poisson sampled image (noisier version)
+                """
+                # Clip negative values
+                img_count = np.clip(img_count, 0, None)
+                # Poisson sampling: y ~ Poisson(λ=img_count)
+                img_noisy = np.random.poisson(lam=img_count).astype(np.float32)
+                return img_noisy
+
+            poisson_sampled = np.zeros_like(denoised_ema, dtype=np.float32)
+            for i in range(denoised_ema.shape[0]):
+                poisson_sampled[i] = poisson_sample(denoised_ema[i])
+
+            # ===== Optional: Poisson calibration accumulation during validation =====
+            # We accumulate stats here (cheap, since we already have proj_u16 + denoised_ema).
+            # Final plot/csv/summary is saved once per validation in nondist_validation().
+            if isinstance(poisson_calib_ctx, dict) and poisson_calib_ctx.get('enable', False):
+                try:
+                    bin_edges = poisson_calib_ctx['bin_edges']
+                    num_bins = int(poisson_calib_ctx['num_bins'])
+                    n = poisson_calib_ctx['n']
+                    sum_lam = poisson_calib_ctx['sum_lambda']
+                    sum_r = poisson_calib_ctx['sum_r']
+                    sum_r2 = poisson_calib_ctx['sum_r2']
+
+                    y_all = np.clip(proj_u16.astype(np.float32, copy=False), 0.0, None)
+                    lam_all = np.clip(denoised_ema.astype(np.float32, copy=False), 0.0, None)
+
+                    for vi in range(int(y_all.shape[0])):
+                        y = y_all[vi].reshape(-1).astype(np.float64, copy=False)
+                        lam = lam_all[vi].reshape(-1).astype(np.float64, copy=False)
+                        r = y - lam
+
+                        idx = np.digitize(lam, bin_edges, right=False) - 1
+                        idx = np.clip(idx, 0, num_bins - 1).astype(np.int64, copy=False)
+
+                        n += np.bincount(idx, minlength=num_bins).astype(np.float64, copy=False)
+                        sum_lam += np.bincount(idx, weights=lam, minlength=num_bins).astype(np.float64, copy=False)
+                        sum_r += np.bincount(idx, weights=r, minlength=num_bins).astype(np.float64, copy=False)
+                        sum_r2 += np.bincount(idx, weights=r * r, minlength=num_bins).astype(np.float64, copy=False)
+                        poisson_calib_ctx['total_pixels'] = int(poisson_calib_ctx.get('total_pixels', 0) + lam.size)
+
+                    poisson_calib_ctx['num_files_used'] = int(poisson_calib_ctx.get('num_files_used', 0) + 1)
+                except Exception as e:
+                    self.logger.warning(f"Poisson calibration accumulation failed, skipping. Reason: {e}")
+
+            # ===== Optional: LPIPS (alex) between poisson_sample and original, averaged over views =====
+            # NOTE: LPIPS is trained on natural RGB images; interpret with caution for SPECT projections.
+            if bool(val_opt.get('compute_lpips_poisson_vs_original', False)):
+                try:
+                    from basicsr.metrics import calculate_lpips
+                except Exception as e:
+                    self.logger.warning(f"LPIPS metric import failed, skipping. Reason: {e}")
+                else:
+                    # Use a fixed linear max_value to map count-domain images into [0,1] for LPIPS.
+                    # Default: training dataset max_value (often 150.0)
+                    ds_train_opt = (self.opt.get('datasets', {}) or {}).get('train', {}) or {}
+                    lpips_max_value = float(val_opt.get('lpips_max_value', ds_train_opt.get('max_value', 150.0)))
+                    lpips_net = str(val_opt.get('lpips_net', 'alex')).lower()
+                    view_stride = int(val_opt.get('lpips_view_stride', 1))
+                    if view_stride < 1:
+                        view_stride = 1
+
+                    vals = []
+                    for i in range(0, int(proj_u16.shape[0]), view_stride):
+                        a = np.clip(proj_u16[i], 0.0, lpips_max_value) / lpips_max_value
+                        b = np.clip(poisson_sampled[i], 0.0, lpips_max_value) / lpips_max_value
+                        # calculate_lpips expects [0,1] with HWC/CHW; for 2D arrays HWC is fine.
+                        vals.append(
+                            calculate_lpips(
+                                b,
+                                a,
+                                input_order='HWC',
+                                net=lpips_net,
+                                device='cuda' if torch.cuda.is_available() else 'cpu',
+                            )
+                        )
+
+                    lpips_mean = float(np.mean(vals)) if len(vals) > 0 else float('nan')
+                    sample_name = Path(lq_path).stem if lq_path else Path(output_path).parent.name
+                    self.logger.info(
+                        f"[val][{sample_name}] LPIPS({lpips_net}) poisson_vs_original: {lpips_mean:.6f} "
+                        f"(views={len(vals)}, stride={view_stride}, max_value={lpips_max_value:g})"
+                    )
+                    if tb_logger is not None and getattr(self, 'opt', {}).get('rank', 0) == 0:
+                        tb_logger.add_scalar('metrics/lpips_poisson_vs_original', lpips_mean, current_iter)
 
             # Compute residuals
             proj_f32 = proj_u16.astype(np.float32)
@@ -346,11 +449,35 @@ class SPECT3DModel(SRModel):
             total_counts_denoised_g = float(np.sum(denoised_g))
             total_counts_denoised_ema = float(np.sum(denoised_ema))
             total_counts_bm3d = float(np.sum(denoised_bm3d))
+            total_counts_poisson = float(np.sum(poisson_sampled))
 
             # Calculate reduction percentages
             reduction_g = (total_counts_orig - total_counts_denoised_g) / max(total_counts_orig, 1.0) * 100.0
             reduction_ema = (total_counts_orig - total_counts_denoised_ema) / max(total_counts_orig, 1.0) * 100.0
             reduction_bm3d = (total_counts_orig - total_counts_bm3d) / max(total_counts_orig, 1.0) * 100.0
+            reduction_poisson = (total_counts_orig - total_counts_poisson) / max(total_counts_orig, 1.0) * 100.0
+
+            # Overlay text: total counts over 60 views + delta% vs original.
+            # Use delta% consistent with counts.txt: (new - original)/original * 100.
+            def _delta_pct(new: float, base: float) -> float:
+                if abs(base) < 1e-12:
+                    return float('nan')
+                return (new - base) / base * 100.0
+
+            def _fmt_counts(x: float) -> str:
+                try:
+                    return f"{x:,.0f}"
+                except Exception:
+                    return str(x)
+
+            overlay_enabled = bool((val_opt or {}).get('gif_show_total_counts', True))
+            overlay_lines = {
+                'Original': f"Σ={_fmt_counts(total_counts_orig)}\nΔ={_delta_pct(total_counts_orig, total_counts_orig):+.2f}%",
+                'BM3D': f"Σ={_fmt_counts(total_counts_bm3d)}\nΔ={_delta_pct(total_counts_bm3d, total_counts_orig):+.2f}%",
+                'Denoised (g)': f"Σ={_fmt_counts(total_counts_denoised_g)}\nΔ={_delta_pct(total_counts_denoised_g, total_counts_orig):+.2f}%",
+                'Denoised (ema)': f"Σ={_fmt_counts(total_counts_denoised_ema)}\nΔ={_delta_pct(total_counts_denoised_ema, total_counts_orig):+.2f}%",
+                'Poisson Sample': f"Σ={_fmt_counts(total_counts_poisson)}\nΔ={_delta_pct(total_counts_poisson, total_counts_orig):+.2f}%",
+            }
 
             # Per-view count statistics (to diagnose if reduction is uniform across views)
             per_view_counts_orig = np.sum(proj_f32, axis=(1, 2))  # (60,)
@@ -406,8 +533,10 @@ class SPECT3DModel(SRModel):
                     return float(np.percentile(x, p))
                 return float(np.max(x))
 
-            vmax_orig = compute_vmax(proj_f32, 'p99.9')
-            vmax_denoised = compute_vmax(np.concatenate([denoised_g, denoised_ema, denoised_bm3d]), 'p99.9')
+            # For GIF display we use per-patient global max from ORIGINAL projection (stable across views),
+            # and keep log1p in normalize_to_u8 for dynamic range.
+            vmax_orig = float(vmax_display)
+            vmax_denoised = float(vmax_display)
 
             # For residual: use absolute value to compute symmetric range, but don't clip
             # This ensures both positive and negative residuals are visible
@@ -456,67 +585,90 @@ class SPECT3DModel(SRModel):
                 draw.text((x0, y0), text, fill=(255, 255, 255), font=font)
                 return img
 
+            def draw_label_bottom(img, text):
+                """Draw label on bottom-left. Supports multiline via '\\n'."""
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.load_default()
+                except Exception:
+                    font = None
+                pad = 4
+                lines = str(text).split('\n')
+                widths = []
+                heights = []
+                for ln in lines:
+                    bb = draw.textbbox((0, 0), ln, font=font)
+                    widths.append(bb[2] - bb[0])
+                    heights.append(bb[3] - bb[1])
+                tw = int(max(widths) if widths else 0)
+                th = int(sum(heights) + max(0, (len(lines) - 1) * 2))
+                x0 = pad
+                y0 = img.height - pad - th
+                draw.rectangle([x0 - 2, y0 - 2, x0 + tw + 2, y0 + th + 2], fill=(0, 0, 0))
+                yy = y0
+                for ln, hh in zip(lines, heights):
+                    draw.text((x0, yy), ln, fill=(255, 255, 255), font=font)
+                    yy += int(hh) + 2
+                return img
+
             # Generate frames
             frames = []
-            angle_start = -180.0
-            angle_step = 6.0
 
             for i in range(proj_u16.shape[0]):
                 # 1. Original
                 u8_orig = normalize_to_u8(proj_f32[i], 0.0, vmax_orig, gamma=0.8, log1p=True)
                 img_orig = Image.fromarray(u8_orig, mode="L").convert("RGB")
                 img_orig = draw_label(img_orig, "Original")
+                if overlay_enabled:
+                    img_orig = draw_label_bottom(img_orig, overlay_lines['Original'])
 
                 # 2. BM3D Denoised
                 u8_bm3d = normalize_to_u8(denoised_bm3d[i], 0.0, vmax_denoised, gamma=0.8, log1p=True)
                 img_bm3d = Image.fromarray(u8_bm3d, mode="L").convert("RGB")
                 img_bm3d = draw_label(img_bm3d, "BM3D")
+                if overlay_enabled:
+                    img_bm3d = draw_label_bottom(img_bm3d, overlay_lines['BM3D'])
 
                 # 3. Denoised (g)
                 u8_g = normalize_to_u8(denoised_g[i], 0.0, vmax_denoised, gamma=0.8, log1p=True)
                 img_g = Image.fromarray(u8_g, mode="L").convert("RGB")
                 img_g = draw_label(img_g, "Denoised (g)")
+                if overlay_enabled:
+                    img_g = draw_label_bottom(img_g, overlay_lines['Denoised (g)'])
 
                 # 4. Denoised (ema)
                 u8_ema = normalize_to_u8(denoised_ema[i], 0.0, vmax_denoised, gamma=0.8, log1p=True)
                 img_ema = Image.fromarray(u8_ema, mode="L").convert("RGB")
                 img_ema = draw_label(img_ema, "Denoised (ema)")
+                if overlay_enabled:
+                    img_ema = draw_label_bottom(img_ema, overlay_lines['Denoised (ema)'])
 
-                # 5. Residual
+                # 5. Poisson Sample (from denoised_ema)
+                u8_poisson = normalize_to_u8(poisson_sampled[i], 0.0, vmax_denoised, gamma=0.8, log1p=True)
+                img_poisson = Image.fromarray(u8_poisson, mode="L").convert("RGB")
+                img_poisson = draw_label(img_poisson, "Poisson Sample")
+                if overlay_enabled:
+                    img_poisson = draw_label_bottom(img_poisson, overlay_lines['Poisson Sample'])
+
+                # 6. Residual
                 img_residual = apply_colormap(residual_ema[i], vmin_residual, vmax_residual, 'RdBu_r')
                 img_residual = draw_label(img_residual, "Residual (red=+, blue=-)")
 
-                # 6. Residual Anscombe
+                # 7. Residual Anscombe
                 img_residual_anscombe = apply_colormap(residual_ema_anscombe[i], vmin_residual_anscombe, vmax_residual_anscombe, 'RdBu_r')
                 img_residual_anscombe = draw_label(img_residual_anscombe, "Residual Anscombe")
 
-                # Combine into canvas (6 columns)
-                canvas = Image.new('RGB', (img_orig.width * 6, img_orig.height))
+                # Combine into canvas (7 columns)
+                canvas = Image.new('RGB', (img_orig.width * 7, img_orig.height))
                 canvas.paste(img_orig, (0, 0))
                 canvas.paste(img_bm3d, (img_orig.width, 0))
                 canvas.paste(img_g, (img_orig.width * 2, 0))
                 canvas.paste(img_ema, (img_orig.width * 3, 0))
-                canvas.paste(img_residual, (img_orig.width * 4, 0))
-                canvas.paste(img_residual_anscombe, (img_orig.width * 5, 0))
+                canvas.paste(img_poisson, (img_orig.width * 4, 0))
+                canvas.paste(img_residual, (img_orig.width * 5, 0))
+                canvas.paste(img_residual_anscombe, (img_orig.width * 6, 0))
 
-                # Add step and angle info
-                angle = angle_start + i * angle_step
-                # Add count info only on first frame to avoid clutter
-                if i == 0:
-                    count_info = (
-                        f"Counts: Orig={total_counts_orig:,.0f} | "
-                        f"EMA={total_counts_denoised_ema:,.0f} ({reduction_ema:+.1f}%) | "
-                        f"BM3D={total_counts_bm3d:,.0f} ({reduction_bm3d:+.1f}%)"
-                    )
-                    # Add region analysis on first frame
-                    region_info = (
-                        f"High: {high_reduction_ema:+.1f}% | Low: {low_reduction_ema:+.1f}%"
-                    )
-                    info_text = f"Step: {step_str}  |  View {i:02d}/59  |  Angle {angle:.0f}°  |  {count_info}  |  {region_info}"
-                else:
-                    info_text = f"Step: {step_str}  |  View {i:02d}/59  |  Angle {angle:.0f}°"
-                canvas = draw_label(canvas, info_text)
-
+                # No additional text overlay - only column labels are shown
                 frames.append(canvas)
 
             # Save GIF
@@ -601,6 +753,35 @@ class SPECT3DModel(SRModel):
         # Only generate GIF for the first network to save time
         net_tag = eval_networks[0]
 
+        # Optional: Poisson calibration stats during validation (aggregate over the samples we process for GIFs)
+        poisson_calib_opt = merged_val_opt.get('poisson_calibration_opt', {}) or {}
+        poisson_calib_ctx = None
+        if bool(poisson_calib_opt.get('enable', False)):
+            try:
+                bin_width = float(poisson_calib_opt.get('bin_width', 1.0))
+                max_bin = float(poisson_calib_opt.get('max_bin', 150.0))
+                if bin_width <= 0:
+                    raise ValueError('bin_width must be > 0')
+                bin_edges = np.arange(0.0, max_bin + bin_width, bin_width, dtype=np.float32)
+                num_bins = int(len(bin_edges))
+                poisson_calib_ctx = {
+                    'enable': True,
+                    'bin_width': bin_width,
+                    'max_bin': max_bin,
+                    'bin_edges': bin_edges,
+                    'num_bins': num_bins,
+                    'min_count': int(poisson_calib_opt.get('min_count', 20000)),
+                    'n': np.zeros(num_bins, dtype=np.float64),
+                    'sum_lambda': np.zeros(num_bins, dtype=np.float64),
+                    'sum_r': np.zeros(num_bins, dtype=np.float64),
+                    'sum_r2': np.zeros(num_bins, dtype=np.float64),
+                    'num_files_used': 0,
+                    'total_pixels': 0,
+                }
+            except Exception as e:
+                self.logger.warning(f"Invalid poisson_calibration_opt, disabled. Reason: {e}")
+                poisson_calib_ctx = None
+
         num_gifs = 0
         sample_idx = 0  # Global sample index across all batches
         for idx, val_data in enumerate(dataloader):
@@ -666,6 +847,9 @@ class SPECT3DModel(SRModel):
                     output_path=gif_path,
                     current_iter=current_iter,
                     net_tag=net_tag,
+                    tb_logger=tb_logger,
+                    val_opt=merged_val_opt,
+                    poisson_calib_ctx=poisson_calib_ctx,
                 )
 
                 if result:
@@ -683,4 +867,103 @@ class SPECT3DModel(SRModel):
 
         if num_gifs > 0:
             self.logger.info(f"✅ Generated {num_gifs} GIF(s) at iter {current_iter}")
+
+        # Save poisson calibration plot/csv once per validation
+        if isinstance(poisson_calib_ctx, dict) and poisson_calib_ctx.get('enable', False) and self.opt.get('rank', 0) == 0:
+            try:
+                n = poisson_calib_ctx['n']
+                sum_lam = poisson_calib_ctx['sum_lambda']
+                sum_r = poisson_calib_ctx['sum_r']
+                sum_r2 = poisson_calib_ctx['sum_r2']
+                min_count = int(poisson_calib_ctx.get('min_count', 20000))
+                valid = n >= float(min_count)
+
+                mean_lam = np.zeros_like(n, dtype=np.float64)
+                mean_r = np.zeros_like(n, dtype=np.float64)
+                var_r = np.zeros_like(n, dtype=np.float64)
+                mean_lam[valid] = sum_lam[valid] / n[valid]
+                mean_r[valid] = sum_r[valid] / n[valid]
+                var_r[valid] = sum_r2[valid] / n[valid] - mean_r[valid] ** 2
+
+                ratio = np.zeros_like(mean_lam, dtype=np.float64)
+                ratio[valid] = var_r[valid] / np.maximum(mean_lam[valid], 1e-8)
+
+                # weighted fit var ≈ a*mean + b
+                x = mean_lam[valid]
+                y = var_r[valid]
+                w = n[valid]
+                if x.size >= 2:
+                    A = np.vstack([x, np.ones_like(x)]).T
+                    W = np.diag(w / np.maximum(w.max(), 1.0))
+                    coef = np.linalg.lstsq(W @ A, W @ y, rcond=None)[0]
+                    a, b = float(coef[0]), float(coef[1])
+                else:
+                    a, b = float('nan'), float('nan')
+
+                exp_name = self.opt.get('name', 'unknown')
+                out_dir = str(poisson_calib_opt.get('out_dir', f"experiments/{exp_name}/analysis/poisson_calibration_iter{int(current_iter):d}"))
+                out_dir = out_dir.format(name=exp_name, iter=int(current_iter))
+                os.makedirs(out_dir, exist_ok=True)
+
+                bin_edges = poisson_calib_ctx['bin_edges']
+                num_bins = int(poisson_calib_ctx['num_bins'])
+                bin_width = float(poisson_calib_ctx['bin_width'])
+                max_bin = float(poisson_calib_ctx['max_bin'])
+
+                centers = np.zeros(num_bins, dtype=np.float64)
+                if num_bins >= 2:
+                    centers[:-1] = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+                centers[-1] = max_bin + bin_width / 2.0
+
+                csv_path = osp.join(out_dir, "poisson_calibration_bins.csv")
+                header = "bin_center,n,mean_lambda,var_residual,ratio_var_over_mean,valid"
+                rows = np.stack([centers, n, mean_lam, var_r, ratio, valid.astype(np.float64)], axis=1)
+                np.savetxt(csv_path, rows, delimiter=",", header=header, comments="")
+
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                fig = plt.figure(figsize=(7.2, 5.4), dpi=150)
+                ax = fig.add_subplot(111)
+                ax.scatter(mean_lam[valid], var_r[valid], s=12, c='tab:blue', alpha=0.75, label='bins (valid)')
+                xx = np.linspace(0, max_bin, 200, dtype=np.float64)
+                ax.plot(xx, xx, 'k--', linewidth=1.0, label='Poisson ideal: var=mean')
+                if np.isfinite(a) and np.isfinite(b):
+                    ax.plot(xx, a * xx + b, color='tab:red', linewidth=1.5, label=f'fit: var={a:.3f}*mean+{b:.3f}')
+                ax.set_xlabel("Mean(denoised) in count domain")
+                ax.set_ylabel("Var(residual = y - denoised)")
+                ax.set_title(f"Poisson calibration @ iter {int(current_iter)} (files={int(poisson_calib_ctx.get('num_files_used', 0))})")
+                ax.grid(True, alpha=0.25)
+                ax.legend(loc='upper left', fontsize=8)
+                fig.tight_layout()
+
+                plot_path = osp.join(out_dir, "poisson_calibration_plot.png")
+                fig.savefig(plot_path)
+                plt.close(fig)
+
+                summary_path = osp.join(out_dir, "poisson_calibration_summary.txt")
+                med_ratio = float(np.median(ratio[valid])) if np.any(valid) else float('nan')
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    f.write("Poisson calibration during validation\n")
+                    f.write(f"iter: {int(current_iter)}\n")
+                    f.write(f"files_used: {int(poisson_calib_ctx.get('num_files_used', 0))}\n")
+                    f.write(f"total_pixels: {int(poisson_calib_ctx.get('total_pixels', 0))}\n")
+                    f.write(f"valid_bins (n>={min_count}): {int(np.sum(valid))}/{int(len(valid))}\n")
+                    f.write(f"weighted fit: var ≈ {a:.6f} * mean + {b:.6f}\n")
+                    f.write(f"median(var/mean): {med_ratio:.6f}\n")
+                    f.write(f"saved: {plot_path}\n")
+                    f.write(f"saved: {csv_path}\n")
+
+                self.logger.info(
+                    f"[val] Poisson calibration saved: {out_dir} | "
+                    f"fit var≈{a:.3f}*mean+{b:.3f} | median(var/mean)={med_ratio:.3f} | "
+                    f"files={int(poisson_calib_ctx.get('num_files_used', 0))}"
+                )
+                if tb_logger is not None:
+                    tb_logger.add_scalar("metrics/poisson_calib_slope", a, current_iter)
+                    tb_logger.add_scalar("metrics/poisson_calib_intercept", b, current_iter)
+                    tb_logger.add_scalar("metrics/poisson_calib_median_var_over_mean", med_ratio, current_iter)
+            except Exception as e:
+                self.logger.warning(f"Failed to save poisson calibration during validation: {e}", exc_info=True)
 

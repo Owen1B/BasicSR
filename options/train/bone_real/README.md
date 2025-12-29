@@ -45,6 +45,34 @@ python3 spect_ct/scripts/prepare_bone_projection_dataset.py \
 
 详见：`README_3D_VALIDATION.md`
 
+## 📁 配置文件说明
+
+### ✅ 核心配置（推荐使用）
+
+1. **`n2n_bone_proj_20s_singleview_sota_edge_patch128.yml`** ⭐ **当前使用**
+   - 批量去噪脚本的默认配置
+   - Patch size: 128, Batch size: 16
+   - 包含 Edge-Preserving Loss (GradientLoss)
+   - 总迭代：200k
+
+2. **`n2n_bone_proj_20s_singleview_sota.yml`** ⭐ **基准配置**
+   - README 推荐的基准配置
+   - 对齐 XCAT SOTA 设置
+   - Patch size: 128, Batch size: 16
+   - 总迭代：100k
+
+### 📦 归档配置
+
+实验性配置已归档到 `archived/` 目录：
+- Restormer 变体（6个）
+- TV Loss 变体（4个）
+- Edge Loss 早期版本（1个）
+- 示例和测试配置（2个）
+
+详见：`archived/README.md`
+
+---
+
 ### ✅ 推荐：n2n_bone_proj_20s_singleview_sota.yml（单通道，SOTA-like）
 
 **核心设计**：
@@ -143,10 +171,6 @@ python3 spect_ct/scripts/prepare_bone_projection_dataset.py \
 - XCAT 实验结果: `experiments/n2n_linear_poisson/`
 - 数据集分析: `spect_ct/docs/BONE_DATASET_ANALYSIS.md`
 - 提取脚本: `spect_ct/scripts/prepare_bone_projection_dataset.py`
-
-## 备注：双通道版本（可选）
-如果你将来想尝试把 anterior+posterior 作为 2 通道联合输入，可以使用：
-- `options/train/bone_real/n2n_bone_proj_20s.yml`
 
 ---
 

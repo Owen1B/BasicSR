@@ -1,0 +1,132 @@
+# 60-view (sinogram) training example:
+# - Each .dat file is (60,128,128)
+# - Each sample picks one view, input is 3ch: [proj, umap_integral(view), umap_mip(view)]
+#
+# Precompute μ-map aux cache (recommended):
+#   PYTHONPATH="./:${PYTHONPATH}" python3 spect_ct/scripts/precompute_umap_aux_cache.py \
+#     --paired-root datasets/SPECT229_projection_paired \
+#     --umap-root datasets/SPECT229 \
+#     --out-root datasets/SPECT229_umap_aux_cache_60 \
+#     --mode views --views 60 --skip-existing
+
+name: debug_n2n_spect229_60view_umap3ch
+model_type: SRModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: spect229_60view_train
+    type: SPECT60ViewDatDataset
+    phase: train
+    mode: n2n
+
+    # 60-view projections live under datasets/SPECT229/<patient>/*_Proj4Filter.dat
+    dataroot_gt: datasets/SPECT229
+    pattern_gt: "**/*_Proj4Filter.dat"
+    # split: first 4 patients for val, remaining for train (sorted file order)
+    start_idx: 4
+    end_idx: 229
+
+    views: 60
+    height: 128
+    width: 128
+    dtype: uint16
+
+    max_value: 150.0
+    gt_scale_factor: 1.0
+    clip_max_value: false
+    norm:
+      type: linear
+
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    umap_aux:
+      enable: true
+      use_line_integral: true
+      use_mip: true
+      cache_root: datasets/SPECT229_umap_aux_cache_60
+      cache_suffix: views60
+
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 32
+    dataset_enlarge_ratio: 4
+
+  val:
+    name: spect229_60view_val
+    type: SPECT60ViewDatDataset
+    phase: val
+    mode: n2n
+    dataroot_gt: datasets/SPECT229
+    pattern_gt: "**/*_Proj4Filter.dat"
+    # split: first 4 patients for val (sorted file order)
+    start_idx: 0
+    end_idx: 4
+    views: 60
+    height: 128
+    width: 128
+    dtype: uint16
+    max_value: 150.0
+    gt_scale_factor: 1.0
+    norm:
+      type: linear
+    umap_aux:
+      enable: true
+      use_line_integral: true
+      use_mip: true
+      cache_root: datasets/SPECT229_umap_aux_cache_60
+      cache_suffix: views60
+
+network_g:
+  type: UNetRes
+  in_nc: 3
+  out_nc: 1
+  nf: 64
+  nb: 4
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [500000]
+    restart_weights: [1]
+    eta_min: !!float 1e-5
+
+  total_iter: 500000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    norm_type: linear
+
+val:
+  val_freq: 5000
+  save_img: true
+  poisson_calibration_opt:
+    enable: true
+    max_samples: 3
+    data_range: 150.0
+
+logger:
+  print_freq: 200
+  save_checkpoint_freq: 5000
+  use_tb_logger: true
+  wandb:
+    project: spect_selfsup_denoising
+    resume_id: ~
+

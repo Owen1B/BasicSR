@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from torch.utils import data as data
+from scipy.ndimage import rotate as nd_rotate
+import os
 
 from basicsr.data.transforms import augment, paired_random_crop
 from basicsr.utils.anscombe import anscombe_forward, anscombe_inverse_algebraic, anscombe_inverse_unbiased
@@ -36,6 +38,62 @@ def _ensure_hwc(img_hw: np.ndarray) -> np.ndarray:
     if img_hw.ndim == 3:
         return img_hw.astype(np.float32, copy=False)
     return img_hw[..., None].astype(np.float32, copy=False)
+
+
+def _parse_patient_from_basename(basename: str) -> str:
+    """从诸如 `AnYufeng_pair00` 提取病人名 `AnYufeng`。"""
+    if "_pair" in basename:
+        return basename.split("_pair", 1)[0]
+    return basename.split("_", 1)[0]
+
+
+def _load_mu_map_zyx(mu_path: str) -> np.ndarray:
+    """加载 μ-map，返回 (z,y,x) float32。当前仅支持 128^3。"""
+    arr = np.fromfile(mu_path, dtype=np.float32)
+    if arr.size == 128 * 128 * 128:
+        return arr.reshape(128, 128, 128)
+    raise ValueError(f"Unsupported μ-map size: {mu_path}, numel={arr.size}")
+
+
+def _mu_project_two_views_zyx(
+    mu_zyx: np.ndarray,
+    angles_deg: Tuple[float, float],
+    rotate_order: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """对 μ-map 做简化平行束投影，返回两张 view 的 (H,W)：
+    - line integral: sum_y μ
+    - mip: max_y μ
+
+    输出二维图是 (z,x)，在本项目里等价于 (H,W)。
+    """
+    if mu_zyx.ndim != 3:
+        raise ValueError(f"mu_zyx must be 3D, got {mu_zyx.shape}")
+
+    outs_li = []
+    outs_mip = []
+    for a in angles_deg:
+        rot = nd_rotate(
+            mu_zyx,
+            angle=float(a),
+            axes=(1, 2),
+            reshape=False,
+            order=int(rotate_order),
+            mode="constant",
+            cval=0.0,
+            prefilter=(rotate_order > 1),
+        )
+        outs_li.append(rot.sum(axis=1).astype(np.float32, copy=False))
+        outs_mip.append(rot.max(axis=1).astype(np.float32, copy=False))
+
+    li = np.stack(outs_li, axis=0)    # (2,H,W)
+    mip = np.stack(outs_mip, axis=0)  # (2,H,W)
+    return li, mip
+
+
+def _norm_clip_div(x: np.ndarray, max_value: float) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    x = np.clip(x, 0.0, float(max_value))
+    return (x / float(max_value)).astype(np.float32, copy=False)
 
 
 def _slice_range(items: List[str], start_idx: int, end_idx: Optional[int]) -> List[str]:
@@ -204,6 +262,35 @@ class SPECTDatPairedDataset(data.Dataset):
         self._basenames = self._scan_basenames()
         self._basenames = _slice_range(self._basenames, self.start_idx, self.end_idx)
 
+        # Optional: μ-map auxiliary channels (condition input)
+        # Goal: input = [proj, umap_integral, umap_mip], output = [proj]
+        self.umap_aux_opt = opt.get("umap_aux", {}) or {}
+        self.umap_aux_enable = bool(self.umap_aux_opt.get("enable", False))
+        self.umap_root = self.umap_aux_opt.get("root", "datasets/SPECT229")
+        self.umap_filename = self.umap_aux_opt.get("filename", "{patient}_PostAtten.dat")
+        # For A/P paired projection, default view mapping matches convert_60views_to_ap.py: view0 & view30
+        self.umap_anterior_view_index = int(self.umap_aux_opt.get("anterior_view_index", 0))
+        self.umap_posterior_view_index = int(self.umap_aux_opt.get("posterior_view_index", 30))
+        self.umap_start_angle_deg = float(self.umap_aux_opt.get("start_angle_deg", -180.0))
+        self.umap_angle_step_deg = float(self.umap_aux_opt.get("angle_step_deg", 6.0))
+        self.umap_rotate_order = int(self.umap_aux_opt.get("rotate_order", 1))
+        # Which aux channels to include
+        self.umap_use_line_integral = bool(self.umap_aux_opt.get("use_line_integral", True))
+        self.umap_use_mip = bool(self.umap_aux_opt.get("use_mip", True))
+        # Normalization for aux channels (to [0,1])
+        self.umap_line_integral_max = float(self.umap_aux_opt.get("line_integral_max", 2.0))
+        self.umap_mip_max = float(self.umap_aux_opt.get("mip_max", 0.05))
+        self.umap_cache_root = self.umap_aux_opt.get("cache_root", None)
+        self.umap_cache_root = str(self.umap_cache_root) if self.umap_cache_root not in [None, ""] else None
+        # Cache per patient (to avoid repeated projections)
+        self._umap_cache: dict[str, dict[str, np.ndarray]] = {}
+        self._umap_warned_missing = False
+
+        if self.umap_aux_enable:
+            # For now we only support split1 training (single view) for channel concatenation.
+            if not (self.view_mode == "split1" and not self.force_stack_for_val):
+                raise ValueError("umap_aux currently requires view_mode=split1 (single-view).")
+
     def _scan_basenames(self) -> List[str]:
         # stable order: sorted by filename
         gt_files = [v for v in scandir(self.gt_root, full_path=False) if v.lower().endswith('.dat')]
@@ -288,6 +375,7 @@ class SPECTDatPairedDataset(data.Dataset):
     def __getitem__(self, index: int) -> Dict:
         base_index, view_id = self._map_index(index)
         basename = self._basenames[base_index]
+        patient = _parse_patient_from_basename(basename)
 
         lq_img, gt_img, lq_path, gt_path = self._load_pair(basename)
 
@@ -300,15 +388,84 @@ class SPECTDatPairedDataset(data.Dataset):
             lq_img = lq_img.astype(np.float32, copy=False)
             gt_img = gt_img.astype(np.float32, copy=False)
 
+        # Build μ-map aux channels (H,W,C_aux) BEFORE crop/augment, so we can crop consistently.
+        aux_img = None
+        if self.umap_aux_enable:
+            if patient not in self._umap_cache:
+                li_ap = None
+                mip_ap = None
+
+                # 1) Try load from disk cache if configured
+                if self.umap_cache_root is not None:
+                    cache_path = osp.join(self.umap_cache_root, f"{patient}_umap_aux_ap.npz")
+                    if osp.exists(cache_path):
+                        z = np.load(cache_path)
+                        li_ap = z["li_ap"].astype(np.float32, copy=False)
+                        mip_ap = z["mip_ap"].astype(np.float32, copy=False)
+
+                # 2) Otherwise compute from μ-map
+                if li_ap is None or mip_ap is None:
+                    mu_path = osp.join(self.umap_root, patient, self.umap_filename.format(patient=patient))
+                    if not osp.exists(mu_path):
+                        if not self._umap_warned_missing:
+                            self._umap_warned_missing = True
+                            print(f"[WARN] μ-map file not found for aux channels: {mu_path}. Will use zeros.")
+                        li_ap = np.zeros((2, self.height, self.width), dtype=np.float32)
+                        mip_ap = np.zeros((2, self.height, self.width), dtype=np.float32)
+                    else:
+                        mu_zyx = _load_mu_map_zyx(mu_path)
+                        a0 = self.umap_start_angle_deg + self.umap_anterior_view_index * self.umap_angle_step_deg
+                        a1 = self.umap_start_angle_deg + self.umap_posterior_view_index * self.umap_angle_step_deg
+                        li_ap, mip_ap = _mu_project_two_views_zyx(
+                            mu_zyx=mu_zyx,
+                            angles_deg=(a0, a1),
+                            rotate_order=self.umap_rotate_order,
+                        )
+                        li_ap = _norm_clip_div(li_ap, self.umap_line_integral_max)
+                        mip_ap = _norm_clip_div(mip_ap, self.umap_mip_max)
+
+                        # Align posterior if dataset flips it
+                        if self.posterior_flip:
+                            li_ap[1] = np.fliplr(li_ap[1])
+                            mip_ap[1] = np.fliplr(mip_ap[1])
+
+                    # write cache (best-effort)
+                    if self.umap_cache_root is not None:
+                        try:
+                            os.makedirs(self.umap_cache_root, exist_ok=True)
+                            cache_path = osp.join(self.umap_cache_root, f"{patient}_umap_aux_ap.npz")
+                            np.savez_compressed(cache_path, li_ap=li_ap, mip_ap=mip_ap)
+                        except Exception:
+                            pass
+
+                self._umap_cache[patient] = {"li_ap": li_ap, "mip_ap": mip_ap}
+
+            li_ap = self._umap_cache[patient]["li_ap"]
+            mip_ap = self._umap_cache[patient]["mip_ap"]
+            chans = []
+            if self.umap_use_line_integral:
+                chans.append(li_ap[view_id][..., None])
+            if self.umap_use_mip:
+                chans.append(mip_ap[view_id][..., None])
+            if len(chans) == 0:
+                raise ValueError("umap_aux.enable=True but no aux channels selected (use_line_integral/use_mip).")
+            aux_img = np.concatenate(chans, axis=2).astype(np.float32, copy=False)  # (H,W,C_aux)
+
         # training augmentation / patch crop
         if self.phase == 'train':
             if self.gt_size is not None:
                 gt_size = int(self.gt_size)
                 # scale=1 for denoising by default
                 scale = int(self.opt.get('scale', 1))
-                gt_img, lq_img = paired_random_crop(gt_img, lq_img, gt_size, scale, gt_path)
+                if aux_img is None:
+                    gt_img, lq_img = paired_random_crop(gt_img, lq_img, gt_size, scale, gt_path)
+                else:
+                    gt_img, (lq_img, aux_img) = paired_random_crop(gt_img, [lq_img, aux_img], gt_size, scale, gt_path)
             if self.use_hflip or self.use_rot:
-                gt_img, lq_img = augment([gt_img, lq_img], self.use_hflip, self.use_rot)
+                if aux_img is None:
+                    gt_img, lq_img = augment([gt_img, lq_img], self.use_hflip, self.use_rot)
+                else:
+                    gt_img, lq_img, aux_img = augment([gt_img, lq_img, aux_img], self.use_hflip, self.use_rot)
 
         # n2n split (online): do it after crop/augment so we only sample on the patch.
         if self.mode == 'n2n':
@@ -328,12 +485,17 @@ class SPECTDatPairedDataset(data.Dataset):
         # normalization
         lq_img, gt_img = self._apply_norm(lq_img, gt_img)
 
+        # concat aux channels after norm (all in [0,1])
+        if aux_img is not None:
+            lq_img = np.concatenate([lq_img, aux_img], axis=2).astype(np.float32, copy=False)
+
         # to tensor: HWC -> CHW
         lq, gt = img2tensor([lq_img, gt_img], bgr2rgb=False, float32=True)
 
         out = {'lq': lq, 'gt': gt, 'lq_path': lq_path, 'gt_path': gt_path}
         if self.view_mode == 'split1' and not self.force_stack_for_val:
             out['view_id'] = view_id
+            out['patient'] = patient
         return out
 
     # Optional helpers for downstream inverse mapping (e.g., in validation/inference)

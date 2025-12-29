@@ -1,5 +1,5 @@
 [Projection Parameters]
-ProjectionFileName=ProjectionImage1_denoised.dat;
+ProjectionFileName=ProjectionImage1.dat;
 Scatter_Prj_Est_File=;
 PrjXDimSize=128;
 PrjZDimSize=128;
@@ -16,18 +16,18 @@ PrjPlaneXAngleTilt=0;//careful,this option may be removed in the future
 PrjPlaneZAngleTilt=0;//careful,this option may be removed in the future
 AngleRangeOfSimpleOrbit=360.00;
 StartAngleOfSimpleOrbit=-180.00;
-ColFace_To_CenterOfFOV=135.07;
+ColFace_To_CenterOfFOV=176.19;
 UseComplexOrbit=1;
 CpOrbitDescSize=7; // only needed when 
 CpOrbitFileName=orbit.orb;
 
 [Reconstruction Parameters]
-OutputImageFileName=ZhaoMeiLan_denoised_OSEMReconed_Iter30.dat;
+OutputImageFileName=BaiYuzhi_denoised_poisson_OSEMReconed_Iter10.dat;
 OutputDataOffset=0;
 ;InitEst_Image_File_Name=./dummy.raw; //File name of input initial image estimation (optional)
 Image_Pixel_Width=4.400000095;
 Image_Pixel_Height=4.400000095;
-Iterations=30;
+Iterations=10;
 Number_of_Views_Per_Subset=15;
 System_Model=4;
 //Beta_s=0;

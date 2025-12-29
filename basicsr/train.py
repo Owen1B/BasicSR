@@ -31,6 +31,9 @@ def init_tb_loggers(opt):
 def create_train_val_dataloader(opt, logger):
     # create train and val dataloaders
     train_loader, val_loaders = None, []
+    accumulation_steps = int(opt.get('train', {}).get('accumulation_steps', 1))
+    if accumulation_steps < 1:
+        accumulation_steps = 1
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train':
             dataset_enlarge_ratio = dataset_opt.get('dataset_enlarge_ratio', 1)
@@ -44,18 +47,27 @@ def create_train_val_dataloader(opt, logger):
                 sampler=train_sampler,
                 seed=opt['manual_seed'])
 
-            # Calculate iterations per epoch considering drop_last=True in build_dataloader
-            # When drop_last=True, the last incomplete batch is dropped, so we use floor division
-            num_iter_per_epoch = (len(train_set) * dataset_enlarge_ratio) // (dataset_opt['batch_size_per_gpu'] * opt['world_size'])
-            total_iters = int(opt['train']['total_iter'])
-            total_epochs = math.ceil(total_iters / (num_iter_per_epoch))
+            # NOTE:
+            # - DataLoader "iterations per epoch" are micro-batches.
+            # - With gradient accumulation, one optimizer step consumes `accumulation_steps` micro-batches.
+            # - `total_iter` in this repo is defined as optimizer steps (the `iter` you see in logs).
+            #
+            # We must therefore compute total_epochs based on required micro-batch budget, otherwise training
+            # may stop early when accumulation_steps > 1.
+            micro_iters_per_epoch = (len(train_set) * dataset_enlarge_ratio) // (
+                dataset_opt['batch_size_per_gpu'] * opt['world_size']
+            )
+            total_iters = int(opt['train']['total_iter'])  # optimizer steps
+            total_micro_iters = total_iters * accumulation_steps
+            total_epochs = math.ceil(total_micro_iters / max(micro_iters_per_epoch, 1))
             logger.info('Training statistics:'
                         f'\n\tNumber of train images: {len(train_set)}'
                         f'\n\tDataset enlarge ratio: {dataset_enlarge_ratio}'
                         f'\n\tBatch size per gpu: {dataset_opt["batch_size_per_gpu"]}'
                         f'\n\tWorld size (gpu number): {opt["world_size"]}'
-                        f'\n\tRequire iter number per epoch: {num_iter_per_epoch}'
-                        f'\n\tTotal epochs: {total_epochs}; iters: {total_iters}.')
+                        f'\n\tMicro-batches per epoch: {micro_iters_per_epoch}'
+                        f'\n\tGradient accumulation steps: {accumulation_steps}'
+                        f'\n\tTotal epochs: {total_epochs}; iters (optimizer steps): {total_iters}.')
         elif phase.split('_')[0] == 'val':
             val_set = build_dataset(dataset_opt)
             val_loader = build_dataloader(
@@ -109,7 +121,15 @@ def train_pipeline(root_path):
     if bool(opt.get('train', {}).get('pbar', False)) and opt.get('rank', 0) == 0:
         os.environ['BASICSR_TQDM_LOGGING'] = '1'
 
-    torch.backends.cudnn.benchmark = True
+    # cuDNN settings
+    # NOTE: Some environments (e.g. certain 4090 + cuDNN Conv3d kernels) can SIGBUS.
+    # Provide a config switch to disable cuDNN for stability (esp. 3D conv).
+    disable_cudnn = bool(opt.get('train', {}).get('disable_cudnn', False))
+    if disable_cudnn:
+        torch.backends.cudnn.enabled = False
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = True
     # torch.backends.cudnn.deterministic = True
 
     # load resume states if necessary
@@ -166,6 +186,11 @@ def train_pipeline(root_path):
     logger.info(f'Start training from epoch: {start_epoch}, iter: {current_iter}')
     data_timer, iter_timer = AvgTimer(), AvgTimer()
     start_time = time.time()
+    accumulation_steps = int(opt.get('train', {}).get('accumulation_steps', 1))
+    if accumulation_steps < 1:
+        accumulation_steps = 1
+    if accumulation_steps > 1:
+        logger.info(f'Enable gradient accumulation: accumulation_steps={accumulation_steps} (effective batch size multiplier)')
     use_train_pbar = bool(opt.get('train', {}).get('pbar', False)) and opt['rank'] == 0
     train_pbar = None
     if use_train_pbar:
@@ -182,58 +207,112 @@ def train_pipeline(root_path):
         prefetcher.reset()
         train_data = prefetcher.next()
 
+        micro_step = 0
         while train_data is not None:
             data_timer.record()
+            if accumulation_steps == 1:
+                current_iter += 1
+                if current_iter > total_iters:
+                    break
+                model.update_learning_rate(current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
+                model.feed_data(train_data)
+                model.optimize_parameters(current_iter)
+                iter_timer.record()
 
-            current_iter += 1
-            if current_iter > total_iters:
-                break
-            # update learning rate
-            model.update_learning_rate(current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
-            # training
-            model.feed_data(train_data)
-            model.optimize_parameters(current_iter)
-            iter_timer.record()
-            if train_pbar is not None:
-                # Keep tqdm postfix lightweight to avoid slowing down training
-                post = {'epoch': epoch}
-                try:
-                    log_dict = model.get_current_log()
-                    if isinstance(log_dict, dict) and 'l_pix' in log_dict:
-                        post['l_pix'] = float(log_dict['l_pix'])
-                except Exception:
-                    pass
-                try:
-                    lrs = model.get_current_learning_rate()
-                    if isinstance(lrs, (list, tuple)) and len(lrs) > 0:
-                        post['lr'] = float(lrs[0])
-                except Exception:
-                    pass
-                train_pbar.set_postfix(post)
-                train_pbar.update(1)
-            if current_iter == 1:
-                # reset start time in msg_logger for more accurate eta_time
-                # not work in resume mode
-                msg_logger.reset_start_time()
-            # log
-            if current_iter % opt['logger']['print_freq'] == 0:
-                log_vars = {'epoch': epoch, 'iter': current_iter}
-                log_vars.update({'lrs': model.get_current_learning_rate()})
-                log_vars.update({'time': iter_timer.get_avg_time(), 'data_time': data_timer.get_avg_time()})
-                log_vars.update(model.get_current_log())
-                msg_logger(log_vars)
+                if train_pbar is not None:
+                    post = {'epoch': epoch}
+                    try:
+                        log_dict = model.get_current_log()
+                        if isinstance(log_dict, dict) and 'l_pix' in log_dict:
+                            post['l_pix'] = float(log_dict['l_pix'])
+                    except Exception:
+                        pass
+                    try:
+                        lrs = model.get_current_learning_rate()
+                        if isinstance(lrs, (list, tuple)) and len(lrs) > 0:
+                            post['lr'] = float(lrs[0])
+                    except Exception:
+                        pass
+                    train_pbar.set_postfix(post)
+                    train_pbar.update(1)
 
-            # save models and training states
-            if current_iter % opt['logger']['save_checkpoint_freq'] == 0:
-                logger.info('Saving models and training states.')
-                model.save(epoch, current_iter)
+                if current_iter == 1:
+                    msg_logger.reset_start_time()
 
-            # validation
-            if opt.get('val') is not None and (current_iter % opt['val']['val_freq'] == 0):
-                if len(val_loaders) > 1:
-                    logger.warning('Multiple validation datasets are *only* supported by SRModel.')
-                for val_loader in val_loaders:
-                    model.validation(val_loader, current_iter, tb_logger, opt['val']['save_img'])
+                if current_iter % opt['logger']['print_freq'] == 0:
+                    log_vars = {'epoch': epoch, 'iter': current_iter}
+                    log_vars.update({'lrs': model.get_current_learning_rate()})
+                    log_vars.update({'time': iter_timer.get_avg_time(), 'data_time': data_timer.get_avg_time()})
+                    log_vars.update(model.get_current_log())
+                    msg_logger(log_vars)
+
+                if current_iter % opt['logger']['save_checkpoint_freq'] == 0:
+                    logger.info('Saving models and training states.')
+                    model.save(epoch, current_iter)
+
+                if opt.get('val') is not None and (current_iter % opt['val']['val_freq'] == 0):
+                    if len(val_loaders) > 1:
+                        logger.warning('Multiple validation datasets are *only* supported by SRModel.')
+                    for val_loader in val_loaders:
+                        model.validation(val_loader, current_iter, tb_logger, opt['val']['save_img'])
+            else:
+                # gradient accumulation: one "iter" == one optimizer step
+                micro_step += 1
+                if micro_step == 1:
+                    current_iter += 1
+                    if current_iter > total_iters:
+                        break
+                    model.update_learning_rate(current_iter, warmup_iter=opt['train'].get('warmup_iter', -1))
+
+                model.feed_data(train_data)
+                if hasattr(model, 'optimize_parameters_accumulation'):
+                    model.optimize_parameters_accumulation(current_iter, micro_step, accumulation_steps)
+                else:
+                    # fallback: no accumulation support in this model
+                    if micro_step == 1:
+                        model.optimize_parameters(current_iter)
+
+                # only log/update timers/pbar on the real optimizer step
+                if micro_step >= accumulation_steps:
+                    iter_timer.record()
+                    if train_pbar is not None:
+                        post = {'epoch': epoch}
+                        try:
+                            log_dict = model.get_current_log()
+                            if isinstance(log_dict, dict) and 'l_pix' in log_dict:
+                                post['l_pix'] = float(log_dict['l_pix'])
+                        except Exception:
+                            pass
+                        try:
+                            lrs = model.get_current_learning_rate()
+                            if isinstance(lrs, (list, tuple)) and len(lrs) > 0:
+                                post['lr'] = float(lrs[0])
+                        except Exception:
+                            pass
+                        train_pbar.set_postfix(post)
+                        train_pbar.update(1)
+
+                    if current_iter == 1:
+                        msg_logger.reset_start_time()
+
+                    if current_iter % opt['logger']['print_freq'] == 0:
+                        log_vars = {'epoch': epoch, 'iter': current_iter}
+                        log_vars.update({'lrs': model.get_current_learning_rate()})
+                        log_vars.update({'time': iter_timer.get_avg_time(), 'data_time': data_timer.get_avg_time()})
+                        log_vars.update(model.get_current_log())
+                        msg_logger(log_vars)
+
+                    if current_iter % opt['logger']['save_checkpoint_freq'] == 0:
+                        logger.info('Saving models and training states.')
+                        model.save(epoch, current_iter)
+
+                    if opt.get('val') is not None and (current_iter % opt['val']['val_freq'] == 0):
+                        if len(val_loaders) > 1:
+                            logger.warning('Multiple validation datasets are *only* supported by SRModel.')
+                        for val_loader in val_loaders:
+                            model.validation(val_loader, current_iter, tb_logger, opt['val']['save_img'])
+
+                    micro_step = 0
 
             data_timer.start()
             iter_timer.start()

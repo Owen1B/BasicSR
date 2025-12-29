@@ -4,6 +4,7 @@ from tqdm import tqdm
 
 import numpy as np
 import torch
+from contextlib import nullcontext
 
 from basicsr.archs import build_network
 from basicsr.losses import build_loss
@@ -55,6 +56,25 @@ class SRModel(BaseModel):
     def init_training_settings(self):
         self.net_g.train()
         train_opt = self.opt['train']
+
+        # AMP settings (optional)
+        amp_opt = train_opt.get('amp', {}) or {}
+        self.amp_enable = bool(amp_opt.get('enable', False))
+        self.amp_loss_fp32 = bool(amp_opt.get('loss_fp32', True))
+        amp_dtype = str(amp_opt.get('dtype', 'bf16')).lower()  # bf16 | fp16
+        self.amp_dtype = torch.bfloat16 if amp_dtype in ['bf16', 'bfloat16'] else torch.float16
+        self.amp_use_scaler = bool(amp_opt.get('use_scaler', True)) and (self.amp_dtype == torch.float16)
+        self.amp_autocast = nullcontext
+        self.amp_scaler = None
+        if self.amp_enable and self.device.type == 'cuda':
+            try:
+                from torch.cuda.amp import autocast, GradScaler
+                self.amp_autocast = autocast
+                if self.amp_use_scaler:
+                    self.amp_scaler = GradScaler()
+            except Exception:
+                # Fallback: disable AMP if cuda.amp is unavailable
+                self.amp_enable = False
 
         self.ema_decay = train_opt.get('ema_decay', 0)
         if self.ema_decay > 0:
@@ -147,7 +167,19 @@ class SRModel(BaseModel):
 
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
-        self.output = self.net_g(self.lq)
+        if getattr(self, 'amp_enable', False):
+            with self.amp_autocast(enabled=True, dtype=self.amp_dtype):
+                self.output = self.net_g(self.lq)
+        else:
+            self.output = self.net_g(self.lq)
+
+        pred = self.output
+        gt = self.gt
+        lq_ref = self.lq
+        if getattr(self, 'amp_enable', False) and getattr(self, 'amp_loss_fp32', True):
+            pred = pred.float()
+            gt = gt.float()
+            lq_ref = lq_ref.float()
 
         l_total = 0
         loss_dict = OrderedDict()
@@ -155,14 +187,14 @@ class SRModel(BaseModel):
         if self.cri_pix:
             # For PoissonNLLLoss, pass per-sample vmax if available
             if hasattr(self, 'vmax') and self.vmax is not None and 'PoissonNLL' in self.cri_pix.__class__.__name__:
-                l_pix = self.cri_pix(self.output, self.gt, vmax=self.vmax)
+                l_pix = self.cri_pix(pred, gt, vmax=self.vmax)
             else:
-                l_pix = self.cri_pix(self.output, self.gt)
+                l_pix = self.cri_pix(pred, gt)
             l_total += l_pix
             loss_dict['l_pix'] = l_pix
         # perceptual loss
         if self.cri_perceptual:
-            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+            l_percep, l_style = self.cri_perceptual(pred, gt)
             if l_percep is not None:
                 l_total += l_percep
                 loss_dict['l_percep'] = l_percep
@@ -171,7 +203,7 @@ class SRModel(BaseModel):
                 loss_dict['l_style'] = l_style
         # TV regularization loss
         if self.cri_tv:
-            l_tv = self.cri_tv(self.output)
+            l_tv = self.cri_tv(pred)
             l_total += l_tv
             loss_dict['l_tv'] = l_tv
         # Gradient loss (edge preservation)
@@ -179,20 +211,77 @@ class SRModel(BaseModel):
         if self.cri_gradient:
             if hasattr(self.cri_gradient, 'use_input_as_ref') and self.cri_gradient.use_input_as_ref:
                 # Use input as reference (recommended for N2N)
-                l_gradient = self.cri_gradient(self.output, input_ref=self.lq)
+                l_gradient = self.cri_gradient(pred, input_ref=lq_ref)
             else:
                 # Use GT as reference (for supervised training)
-                l_gradient = self.cri_gradient(self.output, target=self.gt)
+                l_gradient = self.cri_gradient(pred, target=gt)
             l_total += l_gradient
             loss_dict['l_gradient'] = l_gradient
 
-        l_total.backward()
-        self.optimizer_g.step()
+        if getattr(self, 'amp_enable', False) and getattr(self, 'amp_scaler', None) is not None:
+            self.amp_scaler.scale(l_total).backward()
+            self.amp_scaler.step(self.optimizer_g)
+            self.amp_scaler.update()
+        else:
+            l_total.backward()
+            self.optimizer_g.step()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
+
+    def optimize_parameters_accumulation(self, current_iter: int, micro_step: int, accumulation_steps: int):
+        """Gradient accumulation training step.
+
+        - We scale the loss by 1/accumulation_steps before backward to keep effective LR unchanged.
+        - We only call optimizer.step()/EMA/log update on the final micro step.
+        """
+        if accumulation_steps <= 1:
+            # Fallback to normal behavior
+            return self.optimize_parameters(current_iter)
+
+        if micro_step == 1:
+            self.optimizer_g.zero_grad()
+
+        self.output = self.net_g(self.lq)
+
+        l_total = 0
+        loss_dict = OrderedDict()
+        if self.cri_pix:
+            if hasattr(self, 'vmax') and self.vmax is not None and 'PoissonNLL' in self.cri_pix.__class__.__name__:
+                l_pix = self.cri_pix(self.output, self.gt, vmax=self.vmax)
+            else:
+                l_pix = self.cri_pix(self.output, self.gt)
+            l_total += l_pix
+            loss_dict['l_pix'] = l_pix
+        if self.cri_perceptual:
+            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+            if l_percep is not None:
+                l_total += l_percep
+                loss_dict['l_percep'] = l_percep
+            if l_style is not None:
+                l_total += l_style
+                loss_dict['l_style'] = l_style
+        if self.cri_tv:
+            l_tv = self.cri_tv(self.output)
+            l_total += l_tv
+            loss_dict['l_tv'] = l_tv
+        if self.cri_gradient:
+            if hasattr(self.cri_gradient, 'use_input_as_ref') and self.cri_gradient.use_input_as_ref:
+                l_gradient = self.cri_gradient(self.output, input_ref=self.lq)
+            else:
+                l_gradient = self.cri_gradient(self.output, target=self.gt)
+            l_total += l_gradient
+            loss_dict['l_gradient'] = l_gradient
+
+        (l_total / float(accumulation_steps)).backward()
+
+        if micro_step >= accumulation_steps:
+            self.optimizer_g.step()
+            self.log_dict = self.reduce_loss_dict(loss_dict)
+            if self.ema_decay > 0:
+                self.model_ema(decay=self.ema_decay)
 
     def test(self):
         if hasattr(self, 'net_g_ema'):
@@ -303,6 +392,43 @@ class SRModel(BaseModel):
 
         ds = dataloader.dataset
         spect_vis_opt = self.opt['val'].get('spect_vis', None)
+        # Optional GIF generation for volume outputs (3D models).
+        # To match SPECT3DModel config style, we reuse:
+        #   val.generate_gif / val.gif_output_dir / val.max_gifs_per_val
+        generate_gif = bool(self.opt.get('val', {}).get('generate_gif', False))
+        gif_output_dir = self.opt.get('val', {}).get('gif_output_dir', None)
+        if gif_output_dir is None:
+            gif_output_dir = f"experiments/{self.opt.get('name', 'unknown')}/visualization/gifs"
+        else:
+            gif_output_dir = str(gif_output_dir).format(name=self.opt.get('name', 'unknown'))
+        gif_max = int(self.opt.get('val', {}).get('max_gifs_per_val', 3))
+        gif_fps = int(self.opt.get('val', {}).get('gif_fps', 10))  # optional
+
+        def _save_volume_gif(save_path: str, lq_v: torch.Tensor, pred_v: torch.Tensor):
+            """Save a simple 2-panel (LQ|Pred) per-view GIF for volume tensors.
+
+            Args:
+                lq_v/pred_v: [1,1,D,H,W] in [0,1] domain.
+            """
+            from PIL import Image
+            import os
+            os.makedirs(osp.dirname(save_path), exist_ok=True)
+
+            lq_v = lq_v.detach().float().cpu().clamp_(0, 1)
+            pred_v = pred_v.detach().float().cpu().clamp_(0, 1)
+            D = int(lq_v.shape[2])
+
+            frames: list[Image.Image] = []
+            for d in range(D):
+                lq = (lq_v[0, 0, d].numpy() * 255.0).round().astype('uint8')
+                pr = (pred_v[0, 0, d].numpy() * 255.0).round().astype('uint8')
+                canvas = np.concatenate([lq, pr], axis=1)
+                frames.append(Image.fromarray(canvas, mode='L'))
+
+            if not frames:
+                return
+            duration_ms = int(1000 / max(gif_fps, 1))
+            frames[0].save(save_path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
 
         def _slice_batch(data_dict, b, batch_size):
             one = {}
@@ -323,11 +449,26 @@ class SRModel(BaseModel):
             raise ValueError(f'Unknown validation network tag: {net_tag}')
 
         def _tensor2img_multi(t: torch.Tensor):
-            """Convert [1,C,H,W] tensor to image(s) for metric framework.
+            """Convert tensor to image(s) for metric/visualization code.
 
-            - For C in {1,3}: return a single HWC uint8 image.
-            - Otherwise: return a list of per-channel HWC uint8 images.
+            Supports:
+            - 2D image: [1,C,H,W]
+            - 3D volume: [1,C,D,H,W]  -> pick one D slice (view) then convert
+            - edge-case: [1,D,H,W] (treat D as "views", pick one)
             """
+            view_idx = int(self.opt.get('val', {}).get('volume_view_index', 0))
+
+            # 3D volume: pick one view along D
+            if t.ndim == 5:
+                d = int(t.shape[2])
+                vi = max(0, min(view_idx, d - 1))
+                t = t[:, :, vi, :, :]
+            # sometimes a volume may be returned as [1,D,H,W]
+            if t.ndim == 4 and int(t.shape[1]) not in [1, 3] and int(t.shape[1]) == int(getattr(ds, 'views', -1)):
+                d = int(t.shape[1])
+                vi = max(0, min(view_idx, d - 1))
+                t = t[:, vi:vi + 1, :, :]
+
             c = int(t.shape[1])
             if c in [1, 3]:
                 return tensor2img([t])
@@ -455,6 +596,7 @@ class SRModel(BaseModel):
                         self.metric_results[out_key] += calculate_metric(metric_data_norm, opt_)
 
         num_images = 0
+        num_volume_gifs = 0
         for idx, val_data in enumerate(dataloader):
             # val_data may contain a batch (e.g., when test.py mistakenly includes a train-phase dataloader).
             # Handle batch>1 robustly by iterating per-sample.
@@ -490,9 +632,14 @@ class SRModel(BaseModel):
                         else:
                             self.output = net(self.lq)
                     visuals = self.get_current_visuals()
-                    metric_data_norm = {'img': _tensor2img_multi(visuals['result'])}
-                    if 'gt' in visuals:
-                        metric_data_norm['img2'] = _tensor2img_multi(visuals['gt'])
+                    # For 3D outputs, tensor2img can fail if we try to interpret the view dimension as channels.
+                    # Only convert to images when we actually need it (save_img / metrics / spect_vis).
+                    need_norm_img = bool(save_img) or bool(with_metrics)
+                    metric_data_norm = {}
+                    if need_norm_img:
+                        metric_data_norm = {'img': _tensor2img_multi(visuals['result'])}
+                        if 'gt' in visuals:
+                            metric_data_norm['img2'] = _tensor2img_multi(visuals['gt'])
 
                     metric_data_count = {}
                     if 'gt' in visuals and hasattr(ds, 'inverse_from_norm'):
@@ -506,8 +653,22 @@ class SRModel(BaseModel):
                             metric_data_count['lq'] = lq_cnt
                             _maybe_save_spect_grid(img_name, net_tag, lq_cnt=lq_cnt, pred_cnt=pred_cnt, gt_cnt=gt_cnt)
 
-                    _maybe_save_img(img_name, net_tag, metric_data_norm.get('img'))
+                    if need_norm_img:
+                        _maybe_save_img(img_name, net_tag, metric_data_norm.get('img'))
                     _accumulate_metrics(net_tag, metric_data_norm, metric_data_count)
+
+                    # GIF for 3D volume outputs (uses the same config keys as SPECT3DModel)
+                    if (
+                        generate_gif
+                        and num_volume_gifs < gif_max
+                        and isinstance(visuals.get('result', None), torch.Tensor)
+                        and visuals['result'].ndim == 5
+                        and int(visuals['result'].shape[1]) == 1
+                    ):
+                        sample_dir = osp.join(gif_output_dir, img_name)
+                        gif_path = osp.join(sample_dir, f'{self.opt.get("name","unknown")}_iter{current_iter}_{net_tag}.gif')
+                        _save_volume_gif(gif_path, visuals['lq'], visuals['result'])
+                        num_volume_gifs += 1
 
                 # tentative for out of GPU memory
                 del self.lq
