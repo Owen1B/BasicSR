@@ -2,8 +2,15 @@
 
 这一目录历史上积累了不少一次性脚本。下面是**建议保留/主要使用**的“主入口”，其余脚本多为分析/调试/历史可视化。
 
+### 0) 交互式工具箱（推荐入口）
+- **脚本**: `toolbox.py`
+- **功能**:
+  - 交互式选择实验目录/ckpt/病人序号范围
+  - 支持 CLI（`list/run/batch`）用于脚本化批跑
+  - 支持推理、推理+重建、GIF、以及指标汇总（LPIPS/Poisson校准/Recon PSNR&SSIM）
+
 ### 1) 3proj + 3recon（2x3 GIF + counts.txt）【主入口】
-- **脚本**: `generate_3projections_3recons_gif.py`（单病人 wrapper；核心实现复用 `spect_ct/pipeline/threeproj3recon.py`）
+- **脚本**: `gen_3proj3recon_gif.py`（单病人 wrapper；核心实现复用 `spect_ct/pipeline/threeproj3recon.py`）
 - **功能**:
   - 原始投影 / 降噪投影 / 降噪+泊松投影（第一行）
   - 三者 OSEM 重建 MIP（第二行）
@@ -33,7 +40,7 @@
   - **统一输出路径**：默认写到 `spect_ct/results/<exp-name>/...`（见 `--results-root/--exp-name`）
 
 ### 6) 泊松拟合评测（新增）
-- **`eval_poisson_fit.py`**:
+- **`eval_poisson_calibration.py`**:
   - 评测 Var(y-λ̂) vs mean(λ̂)（分桶 + 拟合）
   - 输出 plot + csv + summary（默认写到 `spect_ct/results/<exp-name>/poisson_fit/`）
 
@@ -43,9 +50,14 @@
   - 输出位置：`<out-root>/_summary/<tag>/counts_activity_analysis.csv + PNG`
 
 ### 8) 数据处理（新增）
-- **`convert_60views_to_ap.py`**:
+- **`convert_proj60_to_ap.py`**:
   - 把 (60,128,128) 转换成前/后位两通道 (2,128,128)
   - 默认输出到 `spect_ct/results/<exp-name>/converted_ap/`
 
-（已清理：历史分析/调试/遗留 wrapper 已删除，只保留推荐入口。）
+### 9) 对齐检查/诊断（可选）
+- **`viz_recon_atten_align_gif.py`**: recon vs atten 同步旋转 MIP 的 1x2 GIF（对齐检查）
+- **`viz_sinogram_rows.py`**: 按行切 sinogram 并可视化（查条纹/角度一致性）
+
+### 10) 归档（不建议继续维护）
+- `spect_ct/scripts/_archive/forward_project_umap.py`：历史 forward projection/对齐实现，已归档，仅供参考
 

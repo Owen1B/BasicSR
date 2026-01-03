@@ -1,11 +1,12 @@
-# Debug run (100 iters) to check GPU memory for 3D UNet full-volume training (proj-only).
-# NOTE: name contains "debug" so BasicSR disables remote loggers (wandb/tb) by convention in this repo.
+# Clean resume test: load net_g_106000 weights, reinit optimizer/EMA, enable cuDNN
+# If stable for 1000 iters, we know the issue is corrupted resume state (not cuDNN itself)
 
-name: debug_n2n_spect229_60view3d_unet_projonly_full_100iter
+name: n2n_spect229_60view3d_unet_projonly_full_cudnn_test
 model_type: SPECT3DModel
 scale: 1
 num_gpu: 1
 manual_seed: 20020113
+auto_resume: false  # Do NOT resume optimizer/scheduler state
 
 datasets:
   train:
@@ -25,35 +26,32 @@ datasets:
     n2n_p: 0.5
     n2n_random_swap: false
     n2n_round: nearest
-
     start_idx: 4
     end_idx: 229
-
-    num_worker_per_gpu: 2
-    batch_size_per_gpu: 2
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 4  # Back to original
     pin_memory: true
     persistent_workers: true
 
   val:
     name: SPECT229_val_projection
     type: SPECTProjectionDataset
-    phase: val
     dataroot: datasets/SPECT229
     pattern: "**/*_Proj4Filter.dat"
     height: 128
     width: 128
     views: 60
     start_idx: 0
-    end_idx: 1
+    end_idx: 4
     num_worker_per_gpu: 0
-    batch_size_per_gpu: 1
+    batch_size_per_gpu:
     pin_memory: true
 
 network_g:
   type: UNet3DRes
   in_nc: 1
   out_nc: 1
-  nc: [32, 64, 128, 256]
+  nc: [16, 32, 64, 128]
   nb: 2
   bias: false
   global_residual: true
@@ -61,34 +59,32 @@ network_g:
   act: relu
 
 path:
-  pretrain_network_g: ~
-  strict_load_g: false
+  pretrain_network_g: experiments/n2n_spect229_60view3d_unet_projonly_full/models/net_g_106000.pth
+  strict_load_g: true
   resume_state: ~
 
 train:
   pbar: true
-  disable_cudnn: true
+  disable_cudnn: false  # TEST: Enable cuDNN with clean optimizer state
   amp:
     enable: false
     dtype: bf16
     loss_fp32: true
     use_scaler: false
   ema_decay: 0.999
-  accumulation_steps: 8
-
+  accumulation_steps: 1  # Back to original (bsz=4 is enough)
   optim_g:
     type: AdamW
     lr: !!float 1e-4
     weight_decay: !!float 1e-4
     betas: [0.9, 0.999]
-
   scheduler:
     type: CosineAnnealingRestartLR
-    periods: [100]
+    periods: [500000]
     restart_weights: [1]
     eta_min: !!float 1e-5
 
-  total_iter: 100
+  total_iter: 2000  # Just test 2000 iters to verify stability
   warmup_iter: -1
 
   pixel_opt:
@@ -100,17 +96,18 @@ train:
     norm_type: linear
 
 val:
-  val_freq: 8
+  val_freq: 500
   save_img: false
   generate_gif: true
   gif_output_dir: experiments/{name}/visualization/gifs
-  max_gifs_per_val: 1
+  max_gifs_per_val: 3
   metrics: null
 
 logger:
-  print_freq: 1
-  save_checkpoint_freq: 1000000
-  use_tb_logger: false
+  print_freq: 50
+  save_checkpoint_freq: 500
+  keep_ckpt_num: 2
+  keep_state_num: 2
+  use_tb_logger: true
   wandb: null
-
 

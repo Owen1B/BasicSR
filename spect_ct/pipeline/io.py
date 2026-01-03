@@ -45,6 +45,31 @@ def load_projection_i16(path: Path, views: int = 60, h: int = 128, w: int = 128)
     return x.reshape(views, h, w).astype(np.float32, copy=False)
 
 
+def load_projection_f32(path: Path, views: int = 60, h: int = 128, w: int = 128) -> np.ndarray:
+    """读取投影 (views,h,w)，float32（用于保留 denoised 的小数部分）。"""
+    path = Path(path)
+    x = np.fromfile(str(path), dtype=np.float32)
+    expected = int(views * h * w)
+    if x.size != expected:
+        raise ValueError(f"投影大小不匹配(float32): {path}，期望 {expected}，实际 {x.size}")
+    return x.reshape(views, h, w).astype(np.float32, copy=False)
+
+
+def save_projection_f32(path: Path, proj: np.ndarray) -> None:
+    """保存投影为 float32 原始 dat（views,h,w）。
+
+    约定：投影在 count domain，应满足非负。这里会：
+    - 将 NaN/Inf 转为 0
+    - clip 到 >= 0
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    x = np.asarray(proj, dtype=np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.clip(x, 0.0, None)
+    x.tofile(str(path))
+
+
 def save_projection_i16_round_clip(path: Path, proj: np.ndarray) -> None:
     """保存投影为 int16，使用 round() 并 clip 到非负（与我们 counts 统计口径一致）。"""
     path = Path(path)

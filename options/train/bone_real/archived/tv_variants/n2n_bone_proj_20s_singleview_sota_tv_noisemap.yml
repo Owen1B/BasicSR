@@ -1,7 +1,6 @@
-# Bone (real) single-view N2N config with Noise Map Channel
-# Based on: n2n_bone_proj_20s_singleview_sota_tv.yml
-# Added: Noise map channel (1/√pixel_value) as second input channel
-#        Per-angle normalization (each projection normalized by its own vmax)
+# Bone (real) single-view N2N config (ARCHIVED)
+# NOTE: Noise-map-as-a-second-channel is no longer supported in `SPECT3DModel`.
+# This config is kept only for reference and has been converted back to 1ch.
 
 name: n2n_bone_proj_20s_singleview_sota_tv_noisemap
 model_type: SPECT3DModel  # Use SPECT3DModel for automatic GIF generation during validation
@@ -26,11 +25,6 @@ datasets:
     n2n_p: 0.5
     n2n_random_swap: false
     n2n_round: nearest
-
-    # Noise map settings
-    use_noise_map: true
-    use_global_noise_map: true  # Use vmax/100 as global noise map (avoids 1/√0 issue)
-    noise_map_eps: 1.0e-06  # Only used if use_global_noise_map=false
 
     # max_value is still used for some internal checks, but actual normalization
     # is per-angle (each projection normalized by its own vmax)
@@ -81,7 +75,7 @@ datasets:
 
 network_g:
   type: UNetRes
-  in_nc: 2  # ⚠️ Changed from 1 to 2: [normalized_projection, noise_map]
+  in_nc: 1
   out_nc: 1
   nc: [64, 128, 256, 512]
   nb: 4

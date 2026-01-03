@@ -1,14 +1,14 @@
-# 3D UNet full-volume training on 60-view sinogram (proj-only)
-# - Input: (C,D,H,W) = (1,60,128,128)  [proj only]
-# - Output: (1,60,128,128)             [denoised proj]
-# - D dimension (views) uses circular padding in 3D conv (view0 connects to view59)
+# Clean resume from iter 106000 with cuDNN enabled
+# - Load net_g_106000.pth weights (both params + params_ema)
+# - Reinitialize optimizer/scheduler (avoid corrupted resume state)
+# - Enable cuDNN for 2.5x speedup (stable without old optimizer state)
 
-name: n2n_spect229_60view3d_unet_projonly_full
+name: n2n_spect229_60view3d_unet_projonly_full_from106k_cudnn
 model_type: SPECT3DModel
 scale: 1
 num_gpu: 1
 manual_seed: 20020113
-auto_resume: true
+auto_resume: false  # Clean resume: do NOT load training_states
 
 datasets:
   train:
@@ -28,13 +28,10 @@ datasets:
     n2n_p: 0.5
     n2n_random_swap: false
     n2n_round: nearest
-
-    # split: first 4 for val, remaining for train
     start_idx: 4
     end_idx: 229
-
-    num_worker_per_gpu: 16
-    batch_size_per_gpu: 8
+    num_worker_per_gpu: 16  # Restore (spawn mode should fix SIGBUS)
+    batch_size_per_gpu: 4
     pin_memory: true
     persistent_workers: true
 
@@ -56,7 +53,7 @@ network_g:
   type: UNet3DRes
   in_nc: 1
   out_nc: 1
-  nc: [16, 32, 64, 128]  # Reduced from [32,64,128,256] for faster training
+  nc: [16, 32, 64, 128]
   nb: 2
   bias: false
   global_residual: true
@@ -64,20 +61,20 @@ network_g:
   act: relu
 
 path:
-  pretrain_network_g: ~
-  strict_load_g: false
+  pretrain_network_g: experiments/n2n_spect229_60view3d_unet_projonly_full/models/net_g_106000.pth
+  strict_load_g: true
   resume_state: ~
 
 train:
   pbar: true
-  disable_cudnn: false  # Use Python 3.13 env to avoid SIGBUS
+  disable_cudnn: false  # Enable cuDNN (stable with clean optimizer)
   amp:
     enable: false
     dtype: bf16
     loss_fp32: true
     use_scaler: false
   ema_decay: 0.999
-  accumulation_steps: 2  # effective_bsz = 8 * 2 = 16
+  accumulation_steps: 1
   optim_g:
     type: AdamW
     lr: !!float 1e-4
@@ -101,34 +98,18 @@ train:
     norm_type: linear
 
 val:
-  val_freq: 1000
+  val_freq: 2000
   save_img: false
   generate_gif: true
   gif_output_dir: experiments/{name}/visualization/gifs
   max_gifs_per_val: 3
-  # Poisson fitting / calibration analysis (aggregated over the samples used for GIFs)
-  poisson_calibration_opt:
-    enable: true
-    bin_width: 1.0
-    max_bin: 50.0
-    min_count: 10000
-    out_dir: experiments/{name}/analysis/poisson_calibration_iter{iter}
-  # Compute LPIPS between (Poisson(denoised_ema)) and original, repeating Poisson sampling K times.
-  compute_lpips_poisson_vs_original: true
-  # alex: repeat 100 times, vgg: repeat 10 times
-  lpips_nets: [alex, vgg]
-  lpips_poisson_repeats_alex: 100
-  lpips_poisson_repeats_vgg: 10
-  lpips_view_stride: 1
-  lpips_max_value: 150.0
   metrics: null
 
 logger:
   print_freq: 50
-  save_checkpoint_freq: 1000
+  save_checkpoint_freq: 2000
   keep_ckpt_num: 2
   keep_state_num: 2
   use_tb_logger: true
   wandb: null
-
 

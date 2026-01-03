@@ -4,6 +4,8 @@ lmdb
 numpy>=1.17
 opencv-python
 Pillow
+matplotlib
+lpips
 pyyaml
 requests
 scikit-image
@@ -12,4 +14,5 @@ tb-nightly
 torch>=1.7
 torchvision
 tqdm
+questionary>=2.0.1
 yapf
