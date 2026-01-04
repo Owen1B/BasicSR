@@ -48,6 +48,51 @@ def _n2n_binomial_split(x_scaled: np.ndarray, p: float, round_mode: str, random_
     return y_f, z_f
 
 
+def _n2n_same_dose_two_splits_via_binomial(
+    x_scaled: np.ndarray, k: float, round_mode: str, random_swap: bool
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate two same-dose realizations from one count image via multinomial thinning.
+
+    Goal: produce (y1, y2) such that marginally:
+      y1 ~ Poisson( (1/k) * lambda ), y2 ~ Poisson( (1/k) * lambda ),
+    and y1, y2 are independent (Poisson splitting theorem).
+
+    Implementation: sequential binomials on integer trials n:
+      y1 ~ Binomial(n, 1/k)
+      y2 ~ Binomial(n - y1, (1/k)/(1-1/k)) = Binomial(n - y1, 1/(k-1))
+
+    This reduces to the usual complementary split when k=2.
+    """
+    kk = float(k)
+    if kk <= 1.0:
+        raise ValueError(f'k must be > 1. Got: {k}')
+    x_scaled = np.asarray(x_scaled, dtype=np.float32)
+    x_scaled = np.clip(x_scaled, 0.0, None)
+    if round_mode == "nearest":
+        n = np.rint(x_scaled)
+    elif round_mode == "floor":
+        n = np.floor(x_scaled)
+    else:
+        raise ValueError(f"Unsupported round_mode: {round_mode}")
+    n = np.clip(n, 0.0, None).astype(np.int64, copy=False)
+
+    # First category prob: 1/k
+    p1 = 1.0 / kk
+    y1 = np.random.binomial(n=n, p=p1).astype(np.int64, copy=False)
+    rem = (n - y1).astype(np.int64, copy=False)
+
+    # Second category conditional prob to achieve marginal 1/k:
+    # p2_cond = (1/k) / (1 - 1/k) = 1/(k-1)
+    p2 = 1.0 / (kk - 1.0)
+    y2 = np.random.binomial(n=rem, p=p2).astype(np.int64, copy=False)
+
+    y1_f = y1.astype(np.float32, copy=False)
+    y2_f = y2.astype(np.float32, copy=False)
+    if random_swap and (np.random.rand() < 0.5):
+        return y2_f, y1_f
+    return y1_f, y2_f
+
+
 def _load_volume_u16(path: str, views: int, h: int, w: int) -> np.ndarray:
     arr = np.fromfile(path, dtype=np.uint16)
     expected = views * h * w
@@ -98,6 +143,18 @@ class SPECT60ViewVolumeDataset(data.Dataset):
         self.n2n_round = str(opt.get("n2n_round", "nearest"))
         if self.n2n_round not in ["nearest", "floor"]:
             raise ValueError(f"Unsupported n2n_round: {self.n2n_round}")
+
+        # mixed-dose N2N (optional): sample k per item and do same-dose two-split thinning
+        self.n2n_k_choices = opt.get("n2n_k_choices", None)
+        if self.n2n_k_choices is not None:
+            ks = [float(x) for x in list(self.n2n_k_choices)]
+            ks = [k for k in ks if k > 1.0]
+            if len(ks) == 0:
+                raise ValueError("n2n_k_choices provided but empty/invalid (need >1).")
+            self.n2n_k_choices = ks
+        self.n2n_split_mode = str(opt.get("n2n_split_mode", "complement")).lower().strip()
+        if self.n2n_split_mode not in ["complement", "same_dose"]:
+            raise ValueError(f"Unsupported n2n_split_mode: {self.n2n_split_mode}. Use complement|same_dose")
 
         # μ-map aux cache (required for 3ch input)
         self.umap_aux_opt = opt.get("umap_aux", {}) or {}
@@ -164,7 +221,11 @@ class SPECT60ViewVolumeDataset(data.Dataset):
             lq = np.random.poisson(lam=gt).astype(np.float32)
         elif self.mode == "n2n":
             # split the full volume
-            lq, gt = _n2n_binomial_split(vol, p=self.n2n_p, round_mode=self.n2n_round, random_swap=self.n2n_random_swap)
+            if self.n2n_k_choices is not None and self.n2n_split_mode == "same_dose":
+                k = float(np.random.choice(self.n2n_k_choices))
+                lq, gt = _n2n_same_dose_two_splits_via_binomial(vol, k=k, round_mode=self.n2n_round, random_swap=self.n2n_random_swap)
+            else:
+                lq, gt = _n2n_binomial_split(vol, p=self.n2n_p, round_mode=self.n2n_round, random_swap=self.n2n_random_swap)
         else:
             raise NotImplementedError("paired mode not implemented for volume dataset yet.")
 

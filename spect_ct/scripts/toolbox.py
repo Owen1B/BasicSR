@@ -17,6 +17,7 @@ import argparse
 import fnmatch
 import json
 import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -34,7 +35,7 @@ from spect_ct.pipeline.experiment import (
     pick_latest_ckpt,
     resolve_patients,
 )
-from spect_ct.pipeline.io import load_projection_i16, load_recon_f32
+from spect_ct.pipeline.io import load_projection_i16, load_recon_f32, save_projection_i16_round_clip
 from spect_ct.pipeline.metrics import PoissonBinStats, lpips_views_mean, psnr_ssim_recon
 from spect_ct.pipeline.original_recon_cache import ensure_original_recon, resolve_patient_paths
 
@@ -196,6 +197,10 @@ class RunConfig:
     rerun_recon: bool
     mp4: bool
     mp4_only: bool
+    # Synthetic low-dose inference via independent thinning from 20s (default disabled).
+    synthetic_thin_factors: Optional[str]
+    synthetic_thin_seed: int
+    synthetic_include_20s: bool
 
 
 def _ckpt_id_from_path(ckpt: Path) -> str:
@@ -214,10 +219,22 @@ def _ckpt_id_from_path(ckpt: Path) -> str:
     return ckpt.stem
 
 
+def _pick_ckpt_best_or_latest(models_dir: Path) -> Path:
+    """Pick ckpt with priority: net_g_best.pth -> net_g_latest.pth -> max iter net_g_<iter>.pth."""
+    models_dir = Path(models_dir)
+    best = models_dir / "net_g_best.pth"
+    if best.is_file():
+        return best
+    return pick_latest_ckpt(models_dir)
+
+
 def _list_ckpts(models_dir: Path) -> list[Path]:
     """List available checkpoints under models_dir (latest first, then iters desc)."""
     models_dir = Path(models_dir)
     out: list[Path] = []
+    best = models_dir / "net_g_best.pth"
+    if best.is_file():
+        out.append(best)
     latest = models_dir / "net_g_latest.pth"
     if latest.is_file():
         out.append(latest)
@@ -238,6 +255,34 @@ def _list_ckpts(models_dir: Path) -> list[Path]:
         seen.add(k)
         uniq.append(p)
     return uniq
+
+
+def _parse_factors(s: Optional[str]) -> list[float]:
+    s = "" if s is None else str(s).strip()
+    if s == "":
+        return []
+    out: list[float] = []
+    for part in s.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        out.append(float(part))
+    return out
+
+
+def _counts_int(x: np.ndarray) -> np.ndarray:
+    """Round+clip to int64 counts."""
+    y = np.round(x.astype(np.float64, copy=False))
+    y = np.clip(y, 0.0, None)
+    return y.astype(np.int64, copy=False)
+
+
+def _poisson_thin_binomial(y: np.ndarray, p: float, rng: np.random.Generator) -> np.ndarray:
+    """Independent thinning: x ~ Binomial(y, p) elementwise."""
+    p = float(p)
+    if p < 0 or p > 1:
+        raise ValueError(f"p must be in [0,1], got {p}")
+    return rng.binomial(y, p).astype(np.int64, copy=False)
 
 
 def run_experiment(
@@ -288,6 +333,22 @@ def run_experiment(
     recon_patients = patients
     if rc.recon_limit is not None:
         recon_patients = patients[: max(0, int(rc.recon_limit))]
+    recon_patients_set = set(recon_patients)
+
+    thin_factors = _parse_factors(getattr(rc, "synthetic_thin_factors", None))
+    use_synth_thin = len(thin_factors) > 0
+    if use_synth_thin:
+        print(
+            "[INFO] synthetic-thin enabled: "
+            + json.dumps(
+                {
+                    "factors": thin_factors,
+                    "seed": int(getattr(rc, "synthetic_thin_seed", 123)),
+                    "include_20s": bool(getattr(rc, "synthetic_include_20s", True)),
+                },
+                ensure_ascii=False,
+            )
+        )
 
     for pi, patient in enumerate(patients):
         print(f"[INFO] [{pi+1:03d}/{len(patients):03d}] patient={patient}")
@@ -297,25 +358,7 @@ def run_experiment(
         atten_file = ppaths.atten
 
         # Decide per-patient stage
-        do_recon = patient in set(recon_patients)
-
-        # Existing outputs (for skip-by-default behavior)
-        patient_out = out_dir / patient
-        den_file = patient_out / "projections" / "denoised_projection.dat"
-        den_f32_file = patient_out / "projections" / "denoised_projection_f32.dat"
-        den_p_file = patient_out / "projections" / "denoised_poisson_projection.dat"
-        recon_den = patient_out / "reconstructions" / f"{patient}_denoised_OSEMReconed_Iter{int(rc.iterations)}.dat"
-        recon_poi = patient_out / "reconstructions" / f"{patient}_denoised_poisson_OSEMReconed_Iter{int(rc.iterations)}.dat"
-        have_denoise = den_file.exists() and den_p_file.exists()
-        have_recon = recon_den.exists() and recon_poi.exists()
-
-        # Desired outputs
-        gif_path = patient_out / "gifs" / f"{patient}_4proj_4recon_2x4.gif"
-        mp4_path = patient_out / "gifs" / f"{patient}_4proj_4recon_2x4.mp4"
-        want_mp4_any = bool(getattr(rc, "mp4", False)) or bool(getattr(rc, "mp4_only", False))
-        want_mp4 = want_mp4_any and (bool(rc.overwrite) or (not mp4_path.exists()))
-        # If mp4-only: never generate gif. If not mp4-only: generate gif only when missing/overwrite.
-        want_gif = (not bool(getattr(rc, "mp4_only", False))) and (bool(rc.overwrite) or (not gif_path.exists()))
+        do_recon = patient in recon_patients_set
 
         # If stage includes recon, ensure original recon cache exists under dataset dir.
         orig_recon_path = None
@@ -335,80 +378,113 @@ def run_experiment(
                 do_recon = False
                 orig_recon_path = None
 
-        # Map stage to pipeline stages
-        if stage in ["denoise", "infer"]:
-            pipe_stage = "denoise"
-            # default: if projections already exist, skip denoise and just re-draw GIF
-            skip_denoise = (not bool(rc.rerun_denoise)) and bool(have_denoise)
-            skip_recon = True
-        elif stage in ["recon", "recon_only"]:
-            pipe_stage = "all"
-            # default: reuse denoised projections if present; otherwise run denoise once
-            skip_denoise = (not bool(rc.rerun_denoise)) and bool(have_denoise)
-            # default: if recon outputs exist, skip recon and just re-draw GIF
-            skip_recon = (not bool(rc.rerun_recon)) and bool(have_recon)
-            if not do_recon:
-                continue
-        elif stage in ["all", "full"]:
-            pipe_stage = "all"
-            # default: if outputs exist, skip compute and just re-draw GIF
-            skip_denoise = (not bool(rc.rerun_denoise)) and bool(have_denoise)
-            if not do_recon:
-                skip_recon = True
-            else:
-                skip_recon = ((not bool(rc.rerun_recon)) and bool(have_recon))
-        else:
-            raise ValueError(f"unsupported stage: {stage}")
+        def _run_one(*, run_patient: str, in_proj: Path, orig_recon_override: Optional[Path]) -> Optional[object]:
+            # Existing outputs (for skip-by-default behavior)
+            patient_out = out_dir / run_patient
+            den_file = patient_out / "projections" / "denoised_projection.dat"
+            den_p_file = patient_out / "projections" / "denoised_poisson_projection.dat"
+            recon_den = patient_out / "reconstructions" / f"{run_patient}_denoised_OSEMReconed_Iter{int(rc.iterations)}.dat"
+            recon_poi = patient_out / "reconstructions" / f"{run_patient}_denoised_poisson_OSEMReconed_Iter{int(rc.iterations)}.dat"
+            have_denoise = den_file.exists() and den_p_file.exists()
+            have_recon = recon_den.exists() and recon_poi.exists()
 
-        try:
-            outputs = process_patient_3proj3recon(
-                patient=patient,
-                checkpoint=rc.ckpt,
-                config=rc.config,
-                input_proj=input_proj,
-                par_file=par_file,
-                orbit_file=orbit_file,
-                atten_file=atten_file,
-                output_dir=out_dir,
-                max_value=float(rc.max_value),
-                iterations=int(rc.iterations),
-                views_per_subset=rc.views_per_subset,
-                # Let pipeline skip if counts+requested visuals already exist (unless overwrite).
-                skip_existing=(not bool(rc.overwrite)),
-                skip_denoise=bool(skip_denoise),
-                skip_recon=bool(skip_recon),
-                use_log1p=bool(rc.use_log1p),
-                device=str(rc.device),
-                stage=pipe_stage,
-                original_recon_path=orig_recon_path,
-                overwrite=bool(rc.overwrite),
-                mp4=want_mp4,
-                gif=want_gif,
-            )
-        except RuntimeError as e:
-            # Recon failures should not kill the whole run; keep denoise/metrics as much as possible.
-            print(f"[WARN][{patient}] pipeline failed (maybe OSEM not runnable): {e}")
-            continue
+            # Desired outputs
+            gif_path = patient_out / "gifs" / f"{run_patient}_4proj_4recon_2x4.gif"
+            mp4_path = patient_out / "gifs" / f"{run_patient}_4proj_4recon_2x4.mp4"
+            want_mp4_any = bool(getattr(rc, "mp4", False)) or bool(getattr(rc, "mp4_only", False))
+            want_mp4 = want_mp4_any and (bool(rc.overwrite) or (not mp4_path.exists()))
+            # If mp4-only: never generate gif. If not mp4-only: generate gif only when missing/overwrite.
+            want_gif = (not bool(getattr(rc, "mp4_only", False))) and (bool(rc.overwrite) or (not gif_path.exists()))
+
+            # Map stage to pipeline stages (per-run)
+            if stage in ["denoise", "infer"]:
+                pipe_stage = "denoise"
+                # default: if projections already exist, skip denoise and just re-draw GIF
+                skip_denoise = (not bool(rc.rerun_denoise)) and bool(have_denoise)
+                skip_recon = True
+            elif stage in ["recon", "recon_only"]:
+                pipe_stage = "all"
+                skip_denoise = (not bool(rc.rerun_denoise)) and bool(have_denoise)
+                skip_recon = (not bool(rc.rerun_recon)) and bool(have_recon)
+                if not do_recon:
+                    return None
+            elif stage in ["all", "full"]:
+                pipe_stage = "all"
+                skip_denoise = (not bool(rc.rerun_denoise)) and bool(have_denoise)
+                if not do_recon:
+                    skip_recon = True
+                else:
+                    skip_recon = ((not bool(rc.rerun_recon)) and bool(have_recon))
+            else:
+                raise ValueError(f"unsupported stage: {stage}")
+
+            try:
+                return process_patient_3proj3recon(
+                    patient=run_patient,
+                    checkpoint=rc.ckpt,
+                    config=rc.config,
+                    input_proj=in_proj,
+                    par_file=par_file,
+                    orbit_file=orbit_file,
+                    atten_file=atten_file,
+                    output_dir=out_dir,
+                    max_value=float(rc.max_value),
+                    iterations=int(rc.iterations),
+                    views_per_subset=rc.views_per_subset,
+                    # Let pipeline skip if counts+requested visuals already exist (unless overwrite).
+                    skip_existing=(not bool(rc.overwrite)),
+                    skip_denoise=bool(skip_denoise),
+                    skip_recon=bool(skip_recon),
+                    use_log1p=bool(rc.use_log1p),
+                    device=str(rc.device),
+                    stage=str(pipe_stage),
+                    original_recon_path=orig_recon_override,
+                    overwrite=bool(rc.overwrite),
+                    mp4=want_mp4,
+                    gif=want_gif,
+                )
+            except RuntimeError as e:
+                print(f"[WARN][{run_patient}] pipeline failed (maybe OSEM not runnable): {e}")
+                return None
+
+        outputs_list: list[object] = []
+        if use_synth_thin:
+            # Optional baseline 20s
+            if bool(getattr(rc, "synthetic_include_20s", True)):
+                out0 = _run_one(run_patient=patient, in_proj=input_proj, orig_recon_override=orig_recon_path)
+                if out0 is not None:
+                    outputs_list.append(out0)
+
+            # Generate x2/x3/x4/x5 from the 20s projection
+            y20 = load_projection_i16(input_proj).astype(np.float32, copy=False)
+            y20i = _counts_int(y20)
+            base_seed = int(getattr(rc, "synthetic_thin_seed", 123)) + int(zlib.adler32(patient.encode("utf-8")))
+            for k in thin_factors:
+                kk = float(k)
+                if kk <= 1.0:
+                    continue
+                rng_k = np.random.default_rng(base_seed + int(round(kk * 1000.0)))
+                xk = _poisson_thin_binomial(y20i, p=1.0 / kk, rng=rng_k).astype(np.float32, copy=False)
+                tag = f"x{kk:g}"
+                in_dir = out_dir / f"{patient}__{tag}" / "_inputs"
+                in_dir.mkdir(parents=True, exist_ok=True)
+                in_file = in_dir / f"{patient}_thin_{tag}_from20s.dat"
+                if bool(rc.overwrite) or (not in_file.exists()):
+                    save_projection_i16_round_clip(in_file, xk)
+                # For low-dose recons, do NOT reuse cached 20s original recon.
+                outk = _run_one(run_patient=f"{patient}__{tag}", in_proj=in_file, orig_recon_override=None)
+                if outk is not None:
+                    outputs_list.append(outk)
+        else:
+            out0 = _run_one(run_patient=patient, in_proj=input_proj, orig_recon_override=orig_recon_path)
+            if out0 is None:
+                continue
+            outputs_list.append(out0)
 
         # Projection-domain metrics (fast): compute BOTH fp32 and uint16 denoised metrics vs original.
         if rc.compute_metrics:
             try:
                 from spect_ct.pipeline.io import load_projection_f32
-                orig_proj = load_projection_i16(input_proj).astype(np.float32, copy=False)
-                # Denoised (uint16 cached) and denoised (fp32 cached, if present)
-                den_u16 = load_projection_i16(outputs.proj_dir / "denoised_projection.dat").astype(np.float32, copy=False)
-                den_fp32 = (
-                    load_projection_f32(outputs.proj_dir / "denoised_projection_f32.dat").astype(np.float32, copy=False)
-                    if (outputs.proj_dir / "denoised_projection_f32.dat").exists()
-                    else den_u16
-                )
-                den_p = load_projection_i16(outputs.proj_dir / "denoised_poisson_projection.dat").astype(np.float32, copy=False)
-
-                # LPIPS
-                lp_d_fp32 = lpips_views_mean(pred=den_fp32, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
-                lp_d_u16 = lpips_views_mean(pred=den_u16, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
-                lp_p = lpips_views_mean(pred=den_p, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
-
                 # PSNR/SSIM (range-aware): prefer BasicSR metrics (cv2-based) in KAIR env; fallback otherwise.
                 try:
                     from basicsr.metrics import calculate_psnr_range, calculate_ssim_range  # type: ignore
@@ -433,43 +509,54 @@ def run_experiment(
                     return float(np.mean(psnrs)) if psnrs else float("nan"), float(np.mean(ssims)) if ssims else float("nan")
 
                 mv = float(rc.max_value)
-                psnr_fp32, ssim_fp32 = _psnr_ssim_views_mean(den_fp32, orig_proj, mv)
-                psnr_u16, ssim_u16 = _psnr_ssim_views_mean(den_u16, orig_proj, mv)
-                psnr_p, ssim_p = _psnr_ssim_views_mean(den_p, orig_proj, mv)
+                for out_obj in outputs_list:
+                    outputs = out_obj  # type: ignore
+                    # Original projection for this run is what pipeline saved (handles synthetic too)
+                    orig_proj = load_projection_i16(Path(outputs.proj_dir) / "original_projection.dat").astype(np.float32, copy=False)
+                    den_u16 = load_projection_i16(Path(outputs.proj_dir) / "denoised_projection.dat").astype(np.float32, copy=False)
+                    den_fp32 = (
+                        load_projection_f32(Path(outputs.proj_dir) / "denoised_projection_f32.dat").astype(np.float32, copy=False)
+                        if (Path(outputs.proj_dir) / "denoised_projection_f32.dat").exists()
+                        else den_u16
+                    )
+                    den_p = load_projection_i16(Path(outputs.proj_dir) / "denoised_poisson_projection.dat").astype(np.float32, copy=False)
 
-                # Quantization gap metrics: fp32 vs u16 (how much rounding/clipping changes the denoised output)
-                psnr_qgap, ssim_qgap = _psnr_ssim_views_mean(den_u16, den_fp32, mv)
+                    # LPIPS
+                    lp_d_fp32 = lpips_views_mean(pred=den_fp32, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
+                    lp_d_u16 = lpips_views_mean(pred=den_u16, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
+                    lp_p = lpips_views_mean(pred=den_p, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
 
-                lpips_rows.append(
-                    {
-                        "patient": patient,
-                        # denoised fp32 vs original
-                        "lpips_denoised_fp32_alex": lp_d_fp32.get("alex", float("nan")),
-                        "lpips_denoised_fp32_vgg": lp_d_fp32.get("vgg", float("nan")),
-                        "psnr_denoised_fp32": psnr_fp32,
-                        "ssim_denoised_fp32": ssim_fp32,
-                        # denoised uint16 vs original
-                        "lpips_denoised_u16_alex": lp_d_u16.get("alex", float("nan")),
-                        "lpips_denoised_u16_vgg": lp_d_u16.get("vgg", float("nan")),
-                        "psnr_denoised_u16": psnr_u16,
-                        "ssim_denoised_u16": ssim_u16,
-                        # poisson vs original (still uint16 stored)
-                        "lpips_poisson_alex": lp_p.get("alex", float("nan")),
-                        "lpips_poisson_vgg": lp_p.get("vgg", float("nan")),
-                        "psnr_poisson": psnr_p,
-                        "ssim_poisson": ssim_p,
-                        # quantization gap: u16 vs fp32 (denoised)
-                        "psnr_u16_vs_fp32": psnr_qgap,
-                        "ssim_u16_vs_fp32": ssim_qgap,
-                    }
-                )
+                    psnr_fp32, ssim_fp32 = _psnr_ssim_views_mean(den_fp32, orig_proj, mv)
+                    psnr_u16, ssim_u16 = _psnr_ssim_views_mean(den_u16, orig_proj, mv)
+                    psnr_p, ssim_p = _psnr_ssim_views_mean(den_p, orig_proj, mv)
+                    psnr_qgap, ssim_qgap = _psnr_ssim_views_mean(den_u16, den_fp32, mv)
 
-                # Poisson calibration accumulation: residual = y - lam_hat
-                y = np.clip(orig_proj, 0.0, None)
-                # Use fp32 denoised as lambda (matches poisson sampling intent).
-                lam = np.clip(den_fp32, 0.0, None)
-                for vi in range(int(y.shape[0])):
-                    pois_stats.update(lam[vi], y[vi])
+                    patient_name = Path(outputs.proj_dir).parents[0].name
+                    lpips_rows.append(
+                        {
+                            "patient": patient_name,
+                            "lpips_denoised_fp32_alex": lp_d_fp32.get("alex", float("nan")),
+                            "lpips_denoised_fp32_vgg": lp_d_fp32.get("vgg", float("nan")),
+                            "psnr_denoised_fp32": psnr_fp32,
+                            "ssim_denoised_fp32": ssim_fp32,
+                            "lpips_denoised_u16_alex": lp_d_u16.get("alex", float("nan")),
+                            "lpips_denoised_u16_vgg": lp_d_u16.get("vgg", float("nan")),
+                            "psnr_denoised_u16": psnr_u16,
+                            "ssim_denoised_u16": ssim_u16,
+                            "lpips_poisson_alex": lp_p.get("alex", float("nan")),
+                            "lpips_poisson_vgg": lp_p.get("vgg", float("nan")),
+                            "psnr_poisson": psnr_p,
+                            "ssim_poisson": ssim_p,
+                            "psnr_u16_vs_fp32": psnr_qgap,
+                            "ssim_u16_vs_fp32": ssim_qgap,
+                        }
+                    )
+
+                    # Poisson calibration accumulation: residual = y - lam_hat
+                    y = np.clip(orig_proj, 0.0, None)
+                    lam = np.clip(den_fp32, 0.0, None)
+                    for vi in range(int(y.shape[0])):
+                        pois_stats.update(lam[vi], y[vi])
             except Exception:
                 pass
 
@@ -477,8 +564,17 @@ def run_experiment(
         if rc.compute_metrics and do_recon and orig_recon_path is not None and not skip_recon:
             try:
                 r_ref = load_recon_f32(orig_recon_path, shape=(128, 128, 128))
-                r_den = load_recon_f32(outputs.recon_dir / f"{patient}_denoised_OSEMReconed_Iter{rc.iterations}.dat", shape=(128, 128, 128))
-                r_poi = load_recon_f32(outputs.recon_dir / f"{patient}_denoised_poisson_OSEMReconed_Iter{rc.iterations}.dat", shape=(128, 128, 128))
+                # Only compute recon metrics for the baseline 20s run (patient name exactly matches).
+                base_out = None
+                for out_obj in outputs_list:
+                    o = out_obj  # type: ignore
+                    if Path(o.recon_dir).parents[0].name == patient:
+                        base_out = o
+                        break
+                if base_out is None:
+                    raise FileNotFoundError("baseline outputs not found for recon metrics")
+                r_den = load_recon_f32(Path(base_out.recon_dir) / f"{patient}_denoised_OSEMReconed_Iter{rc.iterations}.dat", shape=(128, 128, 128))
+                r_poi = load_recon_f32(Path(base_out.recon_dir) / f"{patient}_denoised_poisson_OSEMReconed_Iter{rc.iterations}.dat", shape=(128, 128, 128))
 
                 m_den = psnr_ssim_recon(pred=r_den, ref=r_ref, crop_border=0, data_range=None)
                 m_poi = psnr_ssim_recon(pred=r_poi, ref=r_ref, crop_border=0, data_range=None)
@@ -524,7 +620,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
     _apply_torch_backend_settings(disable_cudnn=bool(getattr(args, "disable_cudnn", False)))
     exp_dir = Path(args.exp)
     config = Path(args.config) if args.config else find_config_for_experiment(exp_dir)
-    ckpt = Path(args.ckpt) if args.ckpt else pick_latest_ckpt(exp_dir / "models")
+    ckpt = Path(args.ckpt) if args.ckpt else _pick_ckpt_best_or_latest(exp_dir / "models")
     ckpt_id = _ckpt_id_from_path(ckpt)
     spect229_dir = Path(args.spect229_dir)
     results_root = Path(args.results_root)
@@ -556,6 +652,9 @@ def _cmd_run(args: argparse.Namespace) -> None:
         rerun_recon=not bool(getattr(args, "no_rerun_recon", False)),
         mp4=bool(getattr(args, "mp4", False)) or bool(getattr(args, "mp4_only", False)),
         mp4_only=bool(getattr(args, "mp4_only", False)),
+        synthetic_thin_factors=str(getattr(args, "synthetic_thin_factors", "") or ""),
+        synthetic_thin_seed=int(getattr(args, "synthetic_thin_seed", 123)),
+        synthetic_include_20s=bool(getattr(args, "synthetic_include_20s", True)),
     )
 
     run_experiment(rc=rc, patients=sel_patients, stage=str(args.stage))
@@ -577,7 +676,7 @@ def _cmd_batch(args: argparse.Namespace) -> None:
 
     for exp_dir in exps:
         config = Path(args.config) if args.config else find_config_for_experiment(exp_dir)
-        ckpt = Path(args.ckpt) if args.ckpt else pick_latest_ckpt(exp_dir / "models")
+        ckpt = Path(args.ckpt) if args.ckpt else _pick_ckpt_best_or_latest(exp_dir / "models")
         ckpt_id = _ckpt_id_from_path(ckpt)
         max_value = float(args.max_value) if args.max_value is not None else _read_yaml_max_value(config, default=150.0)
         rc = RunConfig(
@@ -603,6 +702,9 @@ def _cmd_batch(args: argparse.Namespace) -> None:
             rerun_recon=not bool(getattr(args, "no_rerun_recon", False)),
             mp4=bool(getattr(args, "mp4", False)) or bool(getattr(args, "mp4_only", False)),
             mp4_only=bool(getattr(args, "mp4_only", False)),
+            synthetic_thin_factors=str(getattr(args, "synthetic_thin_factors", "") or ""),
+            synthetic_thin_seed=int(getattr(args, "synthetic_thin_seed", 123)),
+            synthetic_include_20s=bool(getattr(args, "synthetic_include_20s", True)),
         )
         run_experiment(rc=rc, patients=sel_patients, stage=str(args.stage))
 
@@ -711,6 +813,9 @@ def _interactive() -> None:
         rerun_recon=bool(rerun_recon),
         mp4=False,
         mp4_only=False,
+        synthetic_thin_factors=str(dft.get("synthetic_thin_factors", "") or ""),
+        synthetic_thin_seed=int(dft.get("synthetic_thin_seed", 123)),
+        synthetic_include_20s=bool(dft.get("synthetic_include_20s", True)),
     )
     run_experiment(rc=rc, patients=sel_patients, stage=str(stage))
 
@@ -765,6 +870,27 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--mp4", action="store_true", help="also generate mp4 (truecolor) for each patient")
         sp.add_argument("--mp4-only", dest="mp4_only", action="store_true", help="only generate mp4 (skip gif)")
         sp.set_defaults(mp4=False, mp4_only=False)
+
+        # Synthetic low-dose inference via 20s thinning (default OFF).
+        sp.add_argument(
+            "--synthetic-thin-factors",
+            type=str,
+            default="",
+            help="(default OFF) independent thinning from 20s by factors, e.g. '2,3,4,5' (means p=1/k).",
+        )
+        sp.add_argument("--synthetic-thin-seed", type=int, default=123, help="seed for thinning RNG (stable across runs)")
+        sp.add_argument(
+            "--synthetic-include-20s",
+            action="store_true",
+            help="also run baseline 20s alongside synthetic xk rows (default: enabled)",
+        )
+        sp.add_argument(
+            "--synthetic-no-20s",
+            dest="synthetic_include_20s",
+            action="store_false",
+            help="when using --synthetic-thin-factors, do NOT run the baseline 20s row",
+        )
+        sp.set_defaults(synthetic_include_20s=True)
 
     p_run = sub.add_parser("run", help="run one experiment")
     p_run.add_argument("--exp", type=str, required=True, help="experiment dir under experiments/")

@@ -79,6 +79,34 @@ def _n2n_binomial_split(
     return y_f, z_f
 
 
+def _n2n_same_dose_two_splits_via_binomial(
+    x_scaled: np.ndarray, k: float, round_mode: str, random_swap: bool
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Same-dose two-split thinning (see spect60view_volume_dataset.py for detailed rationale)."""
+    kk = float(k)
+    if kk <= 1.0:
+        raise ValueError(f'k must be > 1. Got: {k}')
+    x_scaled = np.asarray(x_scaled, dtype=np.float32)
+    x_scaled = np.clip(x_scaled, 0.0, None)
+    if round_mode == "nearest":
+        n = np.rint(x_scaled)
+    elif round_mode == "floor":
+        n = np.floor(x_scaled)
+    else:
+        raise ValueError(f"Unsupported round_mode: {round_mode}")
+    n = np.clip(n, 0.0, None).astype(np.int64, copy=False)
+    p1 = 1.0 / kk
+    y1 = np.random.binomial(n=n, p=p1).astype(np.int64, copy=False)
+    rem = (n - y1).astype(np.int64, copy=False)
+    p2 = 1.0 / (kk - 1.0)
+    y2 = np.random.binomial(n=rem, p=p2).astype(np.int64, copy=False)
+    y1_f = y1.astype(np.float32, copy=False)
+    y2_f = y2.astype(np.float32, copy=False)
+    if random_swap and (np.random.rand() < 0.5):
+        return y2_f, y1_f
+    return y1_f, y2_f
+
+
 def _load_view_from_dat(
     dat_path: str,
     view_idx: int,
@@ -175,6 +203,18 @@ class SPECT60ViewDatDataset(data.Dataset):
         self.n2n_round = str(opt.get("n2n_round", "nearest"))
         if self.n2n_round not in ["nearest", "floor"]:
             raise ValueError(f"Unsupported n2n_round: {self.n2n_round}. Supported: nearest | floor")
+
+        # mixed-dose N2N (optional): sample k per item and do same-dose two-split thinning
+        self.n2n_k_choices = opt.get("n2n_k_choices", None)
+        if self.n2n_k_choices is not None:
+            ks = [float(x) for x in list(self.n2n_k_choices)]
+            ks = [k for k in ks if k > 1.0]
+            if len(ks) == 0:
+                raise ValueError("n2n_k_choices provided but empty/invalid (need >1).")
+            self.n2n_k_choices = ks
+        self.n2n_split_mode = str(opt.get("n2n_split_mode", "complement")).lower().strip()
+        if self.n2n_split_mode not in ["complement", "same_dose"]:
+            raise ValueError(f"Unsupported n2n_split_mode: {self.n2n_split_mode}. Use complement|same_dose")
 
         # μ-map aux (expects precomputed per-view cache)
         self.umap_aux_opt = opt.get("umap_aux", {}) or {}
@@ -312,12 +352,21 @@ class SPECT60ViewDatDataset(data.Dataset):
 
         # n2n split after crop/augment
         if self.mode == "n2n":
-            lq_img, gt_img = _n2n_binomial_split(
-                gt_img,
-                p=self.n2n_p,
-                round_mode=self.n2n_round,
-                random_swap=self.n2n_random_swap,
-            )
+            if self.n2n_k_choices is not None and self.n2n_split_mode == "same_dose":
+                k = float(np.random.choice(self.n2n_k_choices))
+                lq_img, gt_img = _n2n_same_dose_two_splits_via_binomial(
+                    gt_img,
+                    k=k,
+                    round_mode=self.n2n_round,
+                    random_swap=self.n2n_random_swap,
+                )
+            else:
+                lq_img, gt_img = _n2n_binomial_split(
+                    gt_img,
+                    p=self.n2n_p,
+                    round_mode=self.n2n_round,
+                    random_swap=self.n2n_random_swap,
+                )
 
         if self.clip_max_value:
             lq_img = np.clip(lq_img, 0.0, self.max_value)

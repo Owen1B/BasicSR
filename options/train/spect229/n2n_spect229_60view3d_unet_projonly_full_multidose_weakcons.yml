@@ -1,10 +1,15 @@
-# 3D UNet full-volume training on 60-view sinogram (proj-only)
-# - Input: (C,D,H,W) = (1,60,128,128)  [proj only]
-# - Output: (1,60,128,128)             [denoised proj]
-# - D dimension (views) uses circular padding in 3D conv (view0 connects to view59)
+# Mixed-dose N2N + weak regularization (teacher-student under Poisson corruption)
+#
+# Base: multidose N2N (k in {2,3,4,5}) with same-dose two-split thinning.
+# Weak constraint: SPECT3DConsistencyModel.lowdose_opt
+#   - Teacher = EMA(x)
+#   - Create synthetic lower-dose observation by scaling teacher rate and Poisson sampling
+#   - Student denoises that and matches the scaled teacher rate (in count domain)
+#
+# This pushes low-dose behavior to be consistent with the "most trusted" teacher output.
 
-name: n2n_spect229_60view3d_unet_projonly_full
-model_type: SPECT3DModel
+name: n2n_spect229_60view3d_unet_projonly_full_multidose_weakcons
+model_type: SPECT3DConsistencyModel
 scale: 1
 num_gpu: 1
 manual_seed: 20020113
@@ -25,11 +30,14 @@ datasets:
     max_value: 150.0
     gt_scale_factor: 1.0
     clip_max_value: false
+
+    # Mixed-dose: sample k each item, generate two SAME-dose splits (both 20s/k)
+    n2n_split_mode: same_dose
+    n2n_k_choices: [2, 3, 4, 5]
     n2n_p: 0.5
     n2n_random_swap: false
     n2n_round: nearest
 
-    # split: first 4 for val, remaining for train
     start_idx: 4
     end_idx: 229
 
@@ -56,7 +64,7 @@ network_g:
   type: UNet3DRes
   in_nc: 1
   out_nc: 1
-  nc: [16, 32, 64, 128]  # Reduced from [32,64,128,256] for faster training
+  nc: [16, 32, 64, 128]
   nb: 2
   bias: false
   global_residual: true
@@ -64,23 +72,27 @@ network_g:
   act: relu
 
 path:
-  pretrain_network_g: ~
-  strict_load_g: false
+  # Warm-start from the best EMA checkpoint of the baseline 20s N2N run.
+  # We load params_ema into net_g (param_key_g) so fine-tuning starts from your most trusted weights.
+  pretrain_network_g: experiments/n2n_spect229_60view3d_unet_projonly_full/models/net_g_best.pth
+  param_key_g: params_ema
+  strict_load_g: true
   resume_state: ~
 
 train:
   pbar: true
-  disable_cudnn: false  # Use Python 3.13 env to avoid SIGBUS
+  disable_cudnn: false
   amp:
     enable: false
     dtype: bf16
     loss_fp32: true
     use_scaler: false
   ema_decay: 0.999
-  accumulation_steps: 2  # no grad accumulation
+  accumulation_steps: 2
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
+    # Fine-tune on mixed-dose distribution: use a smaller LR than baseline.
+    lr: !!float 5e-5
     weight_decay: !!float 1e-4
     betas: [0.9, 0.999]
   scheduler:
@@ -100,6 +112,33 @@ train:
     max_value: 150.0
     norm_type: linear
 
+  # Weak constraint: low-dose Poisson consistency on teacher (EMA) rate
+  # Note: this adds an extra forward pass of net_g per iter.
+  consistency_opt:
+    loss_weight: 0.0   # keep off by default; enable if you want cycle-consistency too
+    start_iter: 0
+    target: g_on_input
+    use_ema_teacher: true
+    detach_target: true
+    domain: count
+    loss_type: poisson
+    max_value: 150.0
+    norm_type: linear
+
+  lowdose_opt:
+    loss_weight: 0.05
+    start_iter: 0
+    use_ema_teacher: true
+    detach_target: true
+    domain: count
+    loss_type: poisson
+    # factor s means: A = teacher/s, so s=2..5 roughly matches 10s..4s
+    factor_min: 2.0
+    factor_max: 5.0
+    per_sample: true
+    max_value: 150.0
+    norm_type: linear
+
 val:
   val_freq: 1000
   save_img: false
@@ -113,28 +152,21 @@ val:
   mp4_crf: 18
   mp4_log1p: true
   max_gifs_per_val: 3
-  # Save best checkpoint based on a validation metric (writes net_g_best.pth + EMA params_ema).
   save_best_ckpt: true
   best_metric: lpips_poisson_mean_alex_ema
   eval_networks: [ema]
-  # Poisson fitting / calibration analysis (aggregated over the samples used for GIFs)
   poisson_calibration_opt:
     enable: true
     bin_width: 1.0
     max_bin: 50.0
     min_count: 10000
     out_dir: experiments/{name}/analysis/poisson_calibration_iter{iter}
-  # Compute LPIPS between (Poisson(denoised_ema)) and original, repeating Poisson sampling K times.
   compute_lpips_poisson_vs_original: true
-  # alex: repeat 100 times, vgg: repeat 10 times
   lpips_nets: [alex, vgg]
   lpips_poisson_repeats_alex: 100
   lpips_poisson_repeats_vgg: 10
   lpips_view_stride: 1
   lpips_max_value: 150.0
-  # Batch LPIPS metric for best-model selection:
-  # A = original projection, B = Poisson(denoised_ema)
-  # Metric value = mean over views + repeats.
   lpips_poisson_batch: 4
   lpips_poisson_view_chunk: 10
   metrics:
@@ -144,7 +176,6 @@ val:
       lpips_net: alex
       repeats: 100
       max_value: 150.0
-  # Persist best metric bookkeeping across restarts (auto_resume) so the run "remembers" previous best.
   persist_best_metrics: true
 
 logger:

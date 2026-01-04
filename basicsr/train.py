@@ -167,6 +167,30 @@ def train_pipeline(root_path):
         start_epoch = 0
         current_iter = 0
 
+    # NOTE: If you resume from a checkpoint but changed dataloader-related options (e.g. batch_size_per_gpu,
+    # dataset_enlarge_ratio, accumulation_steps), the computed `total_epochs` may become smaller than
+    # `start_epoch`, causing the epoch loop to be skipped and training to end immediately.
+    # We adjust `total_epochs` to ensure we can still reach `total_iters`.
+    accumulation_steps = int(opt.get('train', {}).get('accumulation_steps', 1))
+    if accumulation_steps < 1:
+        accumulation_steps = 1
+    try:
+        micro_iters_per_epoch = int(len(train_loader))
+    except Exception:
+        micro_iters_per_epoch = 0
+    if resume_state and start_epoch > total_epochs:
+        remaining_iters = max(0, int(total_iters) - int(current_iter))  # optimizer steps
+        remaining_micro_iters = remaining_iters * accumulation_steps
+        denom = max(int(micro_iters_per_epoch), 1)
+        extra_epochs = int(math.ceil(remaining_micro_iters / denom))
+        old_total_epochs = total_epochs
+        total_epochs = int(start_epoch) + int(extra_epochs) + 1
+        logger.warning(
+            f"[resume] start_epoch({start_epoch}) > total_epochs({old_total_epochs}) after option changes. "
+            f"Adjusted total_epochs -> {total_epochs} (micro_iters_per_epoch={micro_iters_per_epoch}, "
+            f"accumulation_steps={accumulation_steps}, remaining_iters={remaining_iters})."
+        )
+
     # create message logger (formatted outputs)
     msg_logger = MessageLogger(opt, current_iter, tb_logger)
 
@@ -186,9 +210,7 @@ def train_pipeline(root_path):
     logger.info(f'Start training from epoch: {start_epoch}, iter: {current_iter}')
     data_timer, iter_timer = AvgTimer(), AvgTimer()
     start_time = time.time()
-    accumulation_steps = int(opt.get('train', {}).get('accumulation_steps', 1))
-    if accumulation_steps < 1:
-        accumulation_steps = 1
+    # (accumulation_steps is already normalized above for resume-robust total_epochs adjustment)
     if accumulation_steps > 1:
         logger.info(f'Enable gradient accumulation: accumulation_steps={accumulation_steps} (effective batch size multiplier)')
     use_train_pbar = bool(opt.get('train', {}).get('pbar', False)) and opt['rank'] == 0

@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import torch
 from collections import OrderedDict
 from copy import deepcopy
@@ -19,6 +20,23 @@ class BaseModel():
         self.is_train = opt['is_train']
         self.schedulers = []
         self.optimizers = []
+        # Optional: persist/restore best metric bookkeeping across restarts.
+        # This prevents "forgetting" best metric on terminal restart (auto_resume) and accidentally
+        # overwriting net_g_best.pth with a worse checkpoint.
+        try:
+            val_opt = (opt.get('val', {}) or {})
+            if bool(val_opt.get('persist_best_metrics', False)):
+                ts_dir = (opt.get('path', {}) or {}).get('training_states', None)
+                if ts_dir and os.path.isdir(ts_dir):
+                    p = os.path.join(ts_dir, 'best_metric_results.json')
+                    if os.path.isfile(p):
+                        with open(p, 'r', encoding='utf-8') as f:
+                            obj = json.load(f)
+                        if isinstance(obj, dict) and isinstance(obj.get('best_metric_results', None), dict):
+                            self.best_metric_results = obj['best_metric_results']
+        except Exception:
+            # Never block training init due to bookkeeping.
+            pass
 
     def feed_data(self, data):
         pass
@@ -63,14 +81,45 @@ class BaseModel():
         self.best_metric_results[dataset_name] = record
 
     def _update_best_metric_result(self, dataset_name, metric, val, current_iter):
+        updated = False
         if self.best_metric_results[dataset_name][metric]['better'] == 'higher':
             if val >= self.best_metric_results[dataset_name][metric]['val']:
                 self.best_metric_results[dataset_name][metric]['val'] = val
                 self.best_metric_results[dataset_name][metric]['iter'] = current_iter
+                updated = True
         else:
             if val <= self.best_metric_results[dataset_name][metric]['val']:
                 self.best_metric_results[dataset_name][metric]['val'] = val
                 self.best_metric_results[dataset_name][metric]['iter'] = current_iter
+                updated = True
+
+        # Persist best metrics immediately when updated (rank0 only), if enabled.
+        try:
+            if updated and bool((self.opt.get('val', {}) or {}).get('persist_best_metrics', False)) and int(self.opt.get('rank', 0)) == 0:
+                ts_dir = (self.opt.get('path', {}) or {}).get('training_states', None)
+                if ts_dir:
+                    os.makedirs(ts_dir, exist_ok=True)
+                    p = os.path.join(ts_dir, 'best_metric_results.json')
+                    payload = {
+                        'iter': int(current_iter),
+                        'dataset_name': str(dataset_name),
+                        'metric': str(metric),
+                        'best_metric_results': self.best_metric_results,
+                    }
+                    # Avoid occasional writing errors
+                    retry = 3
+                    while retry > 0:
+                        try:
+                            with open(p, 'w', encoding='utf-8') as f:
+                                json.dump(payload, f, indent=2, ensure_ascii=False)
+                        except Exception:
+                            time.sleep(1)
+                        else:
+                            break
+                        finally:
+                            retry -= 1
+        except Exception:
+            pass
 
     def model_ema(self, decay=0.999):
         net_g = self.get_bare_model(self.net_g)
@@ -383,6 +432,10 @@ class BaseModel():
                 if wandb_id:
                     state['wandb_id'] = wandb_id
 
+            # Persist best metric results in resume state if present.
+            if hasattr(self, 'best_metric_results'):
+                state['best_metric_results'] = getattr(self, 'best_metric_results', None)
+
             save_filename = f'{current_iter}.state'
             save_path = os.path.join(self.opt['path']['training_states'], save_filename)
 
@@ -455,6 +508,10 @@ class BaseModel():
             self.optimizers[i].load_state_dict(o)
         for i, s in enumerate(resume_schedulers):
             self.schedulers[i].load_state_dict(s)
+
+        # Restore best metric bookkeeping if present.
+        if isinstance(resume_state, dict) and isinstance(resume_state.get('best_metric_results', None), dict):
+            self.best_metric_results = resume_state['best_metric_results']
 
     def reduce_loss_dict(self, loss_dict):
         """reduce loss dict.

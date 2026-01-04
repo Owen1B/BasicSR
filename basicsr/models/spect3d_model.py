@@ -40,6 +40,108 @@ class SPECT3DModel(SRModel):
     def __init__(self, opt):
         super().__init__(opt)
         self.logger = get_root_logger()
+        # Cache LPIPS networks across validations to avoid re-loading weights every time.
+        self._lpips_cache: dict[str, torch.nn.Module] = {}
+
+    def _get_lpips_model(self, net: str, device: torch.device) -> Optional[torch.nn.Module]:
+        """Get (and cache) LPIPS model. Returns None if lpips dependency missing."""
+        name = str(net).lower().strip()
+        if not name:
+            return None
+        if name in self._lpips_cache:
+            m = self._lpips_cache[name]
+            try:
+                m = m.to(device)
+            except Exception:
+                pass
+            return m
+        try:
+            import lpips  # type: ignore
+        except Exception as e:
+            self.logger.warning(f"LPIPS dependency not available, skipping. Reason: {e}")
+            return None
+        m = lpips.LPIPS(net=name).to(device)
+        m.eval()
+        self._lpips_cache[name] = m
+        return m
+
+    @torch.no_grad()
+    def _lpips_poisson_vs_original_mean_batch(
+        self,
+        *,
+        orig_count: np.ndarray,
+        denoised_lambda_count: np.ndarray,
+        lpips_net: str = "alex",
+        repeats: int = 100,
+        max_value: float = 150.0,
+        batch: int = 4,
+        view_chunk: int = 10,
+        view_stride: int = 1,
+        device: torch.device,
+    ) -> float:
+        """Compute mean LPIPS(lpips_net) between A=original and B=Poisson(denoised_lambda), averaged over views + repeats.
+
+        This is the same quantity you've been estimating with scripts, but accelerated with:
+        - Poisson sampling in batches
+        - LPIPS forward in view chunks to control VRAM
+        """
+        mv = float(max(max_value, 1e-6))
+        reps = int(repeats)
+        if reps <= 0:
+            return float("nan")
+        bs = max(1, int(batch))
+        vc = max(1, int(view_chunk))
+        stride = max(1, int(view_stride))
+
+        # (V,H,W) float32
+        orig = np.asarray(orig_count, dtype=np.float32)
+        lam = np.asarray(denoised_lambda_count, dtype=np.float32)
+        if orig.ndim != 3 or lam.ndim != 3:
+            raise ValueError(f"expected orig/lam shape (V,H,W), got orig={orig.shape} lam={lam.shape}")
+        if orig.shape != lam.shape:
+            raise ValueError(f"orig/lam shape mismatch: orig={orig.shape} lam={lam.shape}")
+
+        # Select views
+        v = int(orig.shape[0])
+        sel = np.arange(0, v, stride, dtype=np.int64)
+        orig = orig[sel]
+        lam = lam[sel]
+        v_sel = int(orig.shape[0])
+
+        # Tensors
+        orig_t = torch.from_numpy(np.clip(orig, 0.0, mv) / mv)[None, ...].to(device=device, dtype=torch.float32)  # (1,V,H,W) in [0,1]
+        lam_t = torch.from_numpy(np.clip(lam, 0.0, None)).to(device=device, dtype=torch.float32)  # (V,H,W) count domain
+
+        loss_fn = self._get_lpips_model(lpips_net, device)
+        if loss_fn is None:
+            return float("nan")
+
+        total = 0.0
+        done = 0
+        while done < reps:
+            k = min(bs, reps - done)
+            # Poisson samples: (k,V,H,W) in count domain
+            rate = lam_t[None, ...].expand(k, -1, -1, -1)
+            samp = torch.poisson(rate)
+            samp01 = torch.clamp(samp, 0.0, mv) / mv  # (k,V,H,W) in [0,1]
+
+            # Mean LPIPS over views (chunked)
+            lp_sum = torch.zeros((k,), device=device, dtype=torch.float32)
+            for vs in range(0, v_sel, vc):
+                ve = min(v_sel, vs + vc)
+                chunk = ve - vs
+                xs = samp01[:, vs:ve, :, :].reshape(k * chunk, 1, orig.shape[1], orig.shape[2]).repeat(1, 3, 1, 1)
+                ys = orig_t.expand(k, -1, -1, -1)[:, vs:ve, :, :].reshape(k * chunk, 1, orig.shape[1], orig.shape[2]).repeat(1, 3, 1, 1)
+                # LPIPS expects [-1,1]
+                xs = xs * 2.0 - 1.0
+                ys = ys * 2.0 - 1.0
+                d = loss_fn(xs, ys).reshape(k, chunk).mean(dim=1)  # (k,)
+                lp_sum += d * float(chunk)
+            lp_mean = lp_sum / float(v_sel)  # (k,)
+            total += float(lp_mean.sum().detach().cpu().item())
+            done += k
+
+        return float(total / float(max(reps, 1)))
 
     def _is_3d_data(self, lq_path: str) -> bool:
         """
@@ -153,6 +255,86 @@ class SPECT3DModel(SRModel):
 
         return denoised_bm3d
 
+    def _denoise_pair60_stitch(
+        self,
+        proj_u16: np.ndarray,
+        net: torch.nn.Module,
+        max_value: float,
+        device: torch.device,
+        pair_bs: int = 4,
+        posterior_flip: bool = True,
+    ) -> np.ndarray:
+        """Denoise a 60-view volume using a 2ch net by pairing (i, i+30), flip-aligning posterior, then stitching.
+
+        Args:
+            proj_u16: (60, H, W) count-domain projection
+            net: 2ch 2D network (in_nc=2, out_nc=2)
+            max_value: normalization factor (e.g. 150.0)
+            device: torch device
+            pair_bs: batch size for processing pairs (OOM safety)
+            posterior_flip: whether to flip posterior LR for alignment
+
+        Returns:
+            (60, H, W) denoised projection in count domain
+        """
+        if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
+            raise ValueError(f"pair60_stitch expects proj_u16 shape (60,H,W), got {proj_u16.shape}")
+
+        net.eval()
+        mv = float(max(max_value, 1e-6))
+        H, W = int(proj_u16.shape[1]), int(proj_u16.shape[2])
+
+        # Pair: (0..29) anterior, (30..59) posterior
+        a = proj_u16[:30].astype(np.float32, copy=False)  # (30,H,W)
+        p = proj_u16[30:].astype(np.float32, copy=False)  # (30,H,W)
+
+        # Flip posterior left-right to align with anterior
+        if posterior_flip:
+            p = p[:, :, ::-1]
+
+        x = np.stack([a / mv, p / mv], axis=1).astype(np.float32, copy=False)  # (30,2,H,W)
+
+        # Run in batches to avoid OOM
+        pair_bs = max(1, min(int(pair_bs), 30))
+        yt_list = []
+        with torch.no_grad():
+            for s in range(0, 30, pair_bs):
+                xt = torch.from_numpy(x[s:s + pair_bs]).to(device=device, dtype=torch.float32)
+                try:
+                    yt = net(xt)
+                except torch.OutOfMemoryError:
+                    if device.type == 'cuda':
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    # Retry with batch=1
+                    if pair_bs > 1:
+                        pair_bs = 1
+                        yt_list = []
+                        for s2 in range(0, 30, 1):
+                            xt2 = torch.from_numpy(x[s2:s2 + 1]).to(device=device, dtype=torch.float32)
+                            yt2 = net(xt2)
+                            yt_list.append(torch.clamp(yt2, min=0.0))
+                        break
+                    raise
+                yt_list.append(torch.clamp(yt, min=0.0))
+
+        yt = torch.cat(yt_list, dim=0)  # (30,2,H,W)
+        y = yt.detach().cpu().numpy().astype(np.float32, copy=False) * mv
+
+        out = np.zeros((60, H, W), dtype=np.float32)
+        out_a = y[:, 0]  # (30,H,W)
+        out_p = y[:, 1]
+
+        if posterior_flip:
+            out_p = out_p[:, :, ::-1]  # unflip to original posterior orientation
+
+        out[:30] = out_a
+        out[30:] = out_p
+
+        return out
+
     def _generate_validation_gif(
         self,
         val_data: Dict,
@@ -233,7 +415,7 @@ class SPECT3DModel(SRModel):
                 else:
                     if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
                         self.logger.warning(f"Invalid projection shape: {proj_u16.shape}, expected (60,H,W)")
-                        return None
+                    return None
             elif lq_path and Path(lq_path).exists():
                 # Fallback: load from file
                 if infer_mode == 'paired2ch':
@@ -439,38 +621,6 @@ class SPECT3DModel(SRModel):
                         out[i] = y * vmax_i
                 return out
 
-            def _denoise_pair60_stitch(net: torch.nn.Module) -> np.ndarray:
-                """Denoise a 60-view volume using a 2ch net by pairing (i, i+30), flip-aligning posterior, then stitching."""
-                if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
-                    raise ValueError(f"pair60_stitch expects proj_u16 shape (60,H,W), got {proj_u16.shape}")
-                net.eval()
-                mv = float(max_value_train)
-                if mv < 1e-6:
-                    mv = 1.0
-                H, W = int(proj_u16.shape[1]), int(proj_u16.shape[2])
-                # Pair: (0..29) anterior, (30..59) posterior
-                a = proj_u16[:30].astype(np.float32, copy=False)  # (30,H,W)
-                p = proj_u16[30:].astype(np.float32, copy=False)  # (30,H,W)
-                # Flip posterior left-right to align with anterior
-                posterior_flip = bool(val_opt.get('posterior_flip', True))
-                if posterior_flip:
-                    p = p[:, :, ::-1]
-                x = np.stack([a / mv, p / mv], axis=1).astype(np.float32, copy=False)  # (30,2,H,W)
-                xt = torch.from_numpy(x).to(device=device, dtype=torch.float32)
-                with torch.no_grad():
-                    yt = net(xt)  # (30,2,H,W)
-                    yt = torch.clamp(yt, min=0.0)
-                y = yt.detach().cpu().numpy().astype(np.float32, copy=False)
-                y = y * mv
-                out = np.zeros((60, H, W), dtype=np.float32)
-                out_a = y[:, 0]  # (30,H,W)
-                out_p = y[:, 1]
-                if posterior_flip:
-                    out_p = out_p[:, :, ::-1]  # unflip to original posterior orientation
-                out[:30] = out_a
-                out[30:] = out_p
-                return out
-
             def _denoise_3d_volume(net: torch.nn.Module) -> np.ndarray:
                 """Denoise full (V,H,W) volume with one forward (3D net expects input [1,1,V,H,W])."""
                 net.eval()
@@ -486,7 +636,8 @@ class SPECT3DModel(SRModel):
 
             # g / ema inference
             if infer_mode == 'pair60_stitch':
-                denoised_g = _denoise_pair60_stitch(self.net_g)
+                posterior_flip = bool(val_opt.get('posterior_flip', True))
+                denoised_g = self._denoise_pair60_stitch(proj_u16, self.net_g, max_value_train, device, pair_bs=4, posterior_flip=posterior_flip)
             else:
                 denoised_g = _denoise_3d_volume(self.net_g) if is_3d_net_g else _denoise_2d_per_view(self.net_g)
 
@@ -494,7 +645,8 @@ class SPECT3DModel(SRModel):
             if hasattr(self, 'net_g_ema'):
                 is_3d_net_ema = _is_3d_net(self.net_g_ema)
                 if infer_mode == 'pair60_stitch':
-                    denoised_ema = _denoise_pair60_stitch(self.net_g_ema)
+                    posterior_flip = bool(val_opt.get('posterior_flip', True))
+                    denoised_ema = self._denoise_pair60_stitch(proj_u16, self.net_g_ema, max_value_train, device, pair_bs=4, posterior_flip=posterior_flip)
                 else:
                     denoised_ema = _denoise_3d_volume(self.net_g_ema) if is_3d_net_ema else _denoise_2d_per_view(self.net_g_ema)
             else:
@@ -627,14 +779,14 @@ class SPECT3DModel(SRModel):
                                 continue
                             vals_by_net[net_name].append(
                                 float(
-                                    calculate_lpips(
+                            calculate_lpips(
                                         pred_t,
                                         ref_t,
                                         input_order='CHW',
                                         net=net_name,
                                         device=device_lp,
-                                    )
-                                )
+                            )
+                        )
                             )
 
                     for net_name in nets:
@@ -645,11 +797,11 @@ class SPECT3DModel(SRModel):
                     for net_name in nets:
                         m = lpips_poisson_means.get(net_name, float('nan'))
                         k = lpips_poisson_repeats.get(net_name, 0)
-                        self.logger.info(
+                    self.logger.info(
                             f"[val][{sample_name}] LPIPS({net_name}) poisson_vs_original: {m:.6f} "
                             f"(repeats={k}, views={len(idx)}, stride={view_stride}, max_value={lpips_max_value:g})"
-                        )
-                        if tb_logger is not None and getattr(self, 'opt', {}).get('rank', 0) == 0:
+                    )
+                    if tb_logger is not None and getattr(self, 'opt', {}).get('rank', 0) == 0:
                             tb_logger.add_scalar(f"metrics/lpips_poisson_vs_original_{net_name}", m, current_iter)
 
             # Compute residuals
@@ -1097,6 +1249,458 @@ class SPECT3DModel(SRModel):
             self.logger.warning(f"Error generating GIF: {e}", exc_info=True)
             return None
 
+    def _generate_validation_mp4_thin_factors(
+        self,
+        *,
+        val_data: dict,
+        sample_dir: str,
+        exp_name: str,
+        current_iter: int,
+        net_tag: str,
+        tb_logger,
+        val_opt: dict,
+        poisson_calib_ctx: Optional[dict] = None,
+    ) -> Optional[str]:
+        """MP4 version of validation visualization (replacing legacy GIF when enabled).
+
+        Layout:
+          Rows: 20s (top) + thinned x2/x3/x4/x5 (below), longer time on top.
+          Cols: Original | BM3D | Denoised(g) | Denoised(ema) | Poisson(ema) | Res(ans) | EMA diff
+
+        Key design:
+          - Gray columns are displayed in 20s-equivalent domain: multiply each row by k and use the SAME vmax (20s max).
+          - Poisson(ema) is sampled once per row for the whole 60-view volume (stable across frames).
+          - Overlay shows 60-view total counts in 'w' (1e4) and % diff vs theory (C20/k, based on original 20s).
+        """
+        try:
+            import imageio.v2 as imageio  # type: ignore
+        except Exception as e:
+            self.logger.warning(f"[val] imageio(ffmpeg) not available, skip mp4 generation. Reason: {e}")
+            return None
+        try:
+            # PIL is required for rendering text/frames.
+            from PIL import Image, ImageDraw, ImageFont  # type: ignore
+        except Exception as e:
+            self.logger.warning(f"[val] PIL not available, skip mp4 generation. Reason: {e}")
+            return None
+
+        try:
+            # ---- resolve proj ----
+            proj_data = None
+            for key in ['proj_sequence', 'lq']:
+                if key in val_data:
+                    data = val_data[key]
+                    if isinstance(data, torch.Tensor):
+                        # expected (1,1,V,H,W) or (1,V,H,W) etc
+                        if data.dim() >= 3:
+                            proj_data = data[0].detach().cpu().numpy()
+                            if proj_data.ndim == 4 and proj_data.shape[0] == 1:
+                                proj_data = proj_data[0]
+                        break
+                    if isinstance(data, np.ndarray):
+                        proj_data = data
+                        break
+            if proj_data is None:
+                return None
+            proj_u16 = np.asarray(proj_data, dtype=np.float32)
+            if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
+                return None
+            lq_path = val_data.get("lq_path", "")
+            if isinstance(lq_path, list):
+                lq_path = lq_path[0] if lq_path else ""
+            lq_path = str(lq_path)
+
+            # ---- helpers ----
+            def _counts_int(x: np.ndarray) -> np.ndarray:
+                y = np.rint(x.astype(np.float64, copy=False))
+                y = np.clip(y, 0.0, None)
+                return y.astype(np.int64, copy=False)
+
+            def _anscombe_forward(x: np.ndarray) -> np.ndarray:
+                return 2.0 * np.sqrt(np.maximum(x + 3.0 / 8.0, 0.0))
+
+            def _norm_to_u8(x: np.ndarray, *, vmax: float, use_log1p: bool) -> np.ndarray:
+                vmax = float(vmax)
+                if vmax < 1e-6:
+                    vmax = 1.0
+                y = np.clip(x.astype(np.float32, copy=False), 0.0, vmax)
+                if bool(use_log1p):
+                    y = np.log1p(y) / np.log1p(vmax)
+                else:
+                    y = y / vmax
+                return (y * 255.0).round().clip(0, 255).astype(np.uint8)
+
+            def _signed_to_bwr(x: np.ndarray, *, vmax: float) -> np.ndarray:
+                vmax = float(vmax)
+                if vmax < 1e-6:
+                    vmax = 1.0
+                t = np.clip(x.astype(np.float32, copy=False), -vmax, vmax) / vmax
+                u = (t + 1.0) * 0.5
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    try:
+                        cmap = matplotlib.colormaps.get_cmap("bwr")
+                    except Exception:
+                        import matplotlib.cm as cm
+                        cmap = cm.get_cmap("bwr")
+                    return (cmap(u)[..., :3] * 255.0).round().astype(np.uint8)
+                except Exception:
+                    rgb = np.zeros((*u.shape, 3), dtype=np.float32)
+                    lo = u <= 0.5
+                    hi = ~lo
+                    a = (u[lo] / 0.5)[:, None]
+                    rgb[lo] = (1 - a) * np.array([0, 0, 255], dtype=np.float32) + a * np.array([255, 255, 255], dtype=np.float32)
+                    b = ((u[hi] - 0.5) / 0.5)[:, None]
+                    rgb[hi] = (1 - b) * np.array([255, 255, 255], dtype=np.float32) + b * np.array([255, 0, 0], dtype=np.float32)
+                    return rgb.round().clip(0, 255).astype(np.uint8)
+
+            def _fmt_counts_w_pct(actual: float, theory: float) -> str:
+                theory = float(theory)
+                actual = float(actual)
+                w = actual / 1.0e4
+                if w >= 100:
+                    cstr = f"C={w:.0f}w"
+                elif w >= 10:
+                    cstr = f"C={w:.1f}w"
+                else:
+                    cstr = f"C={w:.2f}w"
+                if theory <= 0:
+                    return cstr
+                pct = (actual - theory) / theory * 100.0
+                pstr = f"{pct:+.0f}%" if abs(pct) >= 10 else f"{pct:+.1f}%"
+                return f"{cstr} ({pstr})"
+
+            def _fmt_w_int(actual: float) -> str:
+                """Format total counts in integer W (1e4). Example: 140W."""
+                w = float(actual) / 1.0e4
+                return f"{int(round(w))}W"
+
+            def _load_font(size: int = 12):
+                try:
+                    return ImageFont.truetype("DejaVuSans.ttf", size=size)
+                except Exception:
+                    return ImageFont.load_default()
+
+            # ---- options ----
+            ds_train_opt = (self.opt.get("datasets", {}) or {}).get("train", {}) or {}
+            mv = float((val_opt or {}).get("max_value", ds_train_opt.get("max_value", 150.0)))
+            mv = float(max(mv, 1e-6))
+
+            factors = val_opt.get("mp4_thin_factors", [2, 3, 4, 5])
+            try:
+                factors = [float(x) for x in list(factors)]
+            except Exception:
+                factors = [2.0, 3.0, 4.0, 5.0]
+            factors = [k for k in factors if float(k) > 1.0]
+            seed = int(val_opt.get("mp4_thin_seed", 123))
+            fps = float(val_opt.get("mp4_fps", 10.0))
+            crf = int(val_opt.get("mp4_crf", 18))
+            use_log1p = bool(val_opt.get("mp4_log1p", True))
+
+            # ---- prepare rows ----
+            y20i = _counts_int(proj_u16)
+            c20 = float(np.sum(y20i.astype(np.float64, copy=False)))
+            if c20 <= 0:
+                c20 = 1.0
+            vmax20 = float(np.max(y20i.astype(np.float32, copy=False)))
+            if vmax20 < 1e-6:
+                vmax20 = 1.0
+
+            # Use FIXED low-dose splits (preferred): load from dataset-level cache if available.
+            # Cache file name matches _load_or_compute_bm3d(): md5(lq_path_with_label)[:16]_{thin|bm3d}.npy
+            def _md5_16(s: str) -> str:
+                import hashlib
+                return hashlib.md5(str(s).encode()).hexdigest()[:16]
+
+            base_rows = [("20s", 1.0, y20i.astype(np.float32, copy=False))]
+            rng = np.random.default_rng(seed)
+
+            # Patient-level cache dir (datasets/SPECT229/<patient>/bm3d_cache[/seed{seed}])
+            ds_cache_dir = None
+            try:
+                lp0 = str(lq_path).split("__")[0]
+                lp_obj = Path(lp0)
+                patient_dir = lp_obj.parent
+                cand_root = patient_dir / "bm3d_cache"
+                if cand_root.exists():
+                    # Prefer seed-scoped readable cache if present
+                    seed_dir = cand_root / f"seed{int(seed)}"
+                    ds_cache_dir = seed_dir if seed_dir.exists() else cand_root
+            except Exception:
+                ds_cache_dir = None
+
+            for k in factors:
+                lab = f"x{k:g}"
+                xk = None
+                if ds_cache_dir is not None:
+                    try:
+                        # Prefer readable name first, then fallback to md5 name.
+                        thin_path = ds_cache_dir / f"{lab}_thin.npy"
+                        if thin_path.exists():
+                            xk = np.load(thin_path).astype(np.float32, copy=False)
+                        else:
+                            key = _md5_16(f"{lp0}__{lab}")
+                            thin_path2 = ds_cache_dir / f"{key}_thin.npy"
+                            if thin_path2.exists():
+                                xk = np.load(thin_path2).astype(np.float32, copy=False)
+                    except Exception:
+                        xk = None
+                if xk is None:
+                    require_cached = bool(val_opt.get("mp4_require_cached_thins", True))
+                    if require_cached:
+                        raise FileNotFoundError(
+                            f"[val][mp4] Missing cached low-dose split: {thin_path}. "
+                            f"Run: python spect_ct/scripts/precompute_validation_bm3d.py --seed {seed} --overwrite"
+                        )
+                    # Optional fallback: generate on-the-fly (deterministic given seed)
+                    xk_i = rng.binomial(y20i, 1.0 / float(k)).astype(np.int64, copy=False)
+                    xk = xk_i.astype(np.float32, copy=False)
+                base_rows.append((lab, float(k), xk))
+
+            def _sec(label: str, k: float) -> float:
+                return 20.0 if label == "20s" else 20.0 / max(float(k), 1e-12)
+
+            base_rows.sort(key=lambda t: _sec(t[0], t[1]), reverse=True)
+
+            # infer
+            net_ema = self.net_g_ema if hasattr(self, "net_g_ema") else self.net_g
+            net_g = self.net_g
+            device = next(net_ema.parameters()).device if hasattr(net_ema, "parameters") else next(net_g.parameters()).device
+
+            def _is_3d_net(net0: torch.nn.Module) -> bool:
+                try:
+                    for m in net0.modules():
+                        if isinstance(m, torch.nn.Conv3d) or isinstance(m, torch.nn.ConvTranspose3d):
+                            return True
+                except Exception:
+                    pass
+                return False
+
+            def _infer_with(netx: torch.nn.Module, proj: np.ndarray) -> np.ndarray:
+                infer_mode = str(val_opt.get("infer_mode", "")).strip().lower()
+                net_in0 = int((self.opt.get("network_g", {}) or {}).get("in_nc", 1))
+                net_out0 = int((self.opt.get("network_g", {}) or {}).get("out_nc", 1))
+                if infer_mode in ["", "auto"]:
+                    if proj.ndim == 3 and proj.shape[0] == 60 and net_in0 == 2 and net_out0 == 2:
+                        infer_mode = "pair60_stitch"
+                    else:
+                        infer_mode = ""
+                if infer_mode == "pair60_stitch":
+                    posterior_flip = bool(val_opt.get("posterior_flip", True))
+                    return self._denoise_pair60_stitch(proj, netx, float(mv), device=device, pair_bs=int(val_opt.get("pair60_stitch_batch", 4)), posterior_flip=posterior_flip)
+                if _is_3d_net(netx):
+                    x = (proj / mv).astype(np.float32, copy=False)
+                    xt = torch.from_numpy(x[None, None, ...]).to(device=device, dtype=torch.float32)
+                    netx.eval()
+                    with torch.no_grad():
+                        yt = netx(xt)
+                        yt = torch.clamp(yt, min=0.0)
+                    return yt[0, 0].detach().cpu().numpy().astype(np.float32, copy=False) * mv
+                out = np.zeros_like(proj, dtype=np.float32)
+                netx.eval()
+                with torch.no_grad():
+                    for i in range(int(proj.shape[0])):
+                        xt = torch.from_numpy((proj[i] / mv)[None, None, ...]).to(device=device, dtype=torch.float32)
+                        yt = netx(xt)
+                        yt = torch.clamp(yt, min=0.0)
+                        out[i] = yt[0, 0].detach().cpu().numpy().astype(np.float32, copy=False) * mv
+                return out
+
+            # Optional tqdm inside MP4 generation (can be slow due to BM3D/LPIPS/60-frame rendering)
+            mp4_tqdm = bool(val_opt.get("mp4_tqdm", ("debug" in str(exp_name).lower())))
+
+            rows = []
+            base_rows_iter = base_rows
+            if mp4_tqdm:
+                base_rows_iter = tqdm(
+                    list(base_rows),
+                    desc=f"mp4-rows[{Path(sample_dir).name}]",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+            for label, k, orig in base_rows_iter:
+                # Denoise with both G and EMA
+                den_g = np.clip(_infer_with(net_g, orig).astype(np.float32, copy=False), 0.0, None)
+                den_ema = np.clip(_infer_with(net_ema, orig).astype(np.float32, copy=False), 0.0, None)
+                # BM3D on original (cached)
+                #
+                # Priority:
+                # 1) If lq_path is inside datasets/SPECT229/<patient>/..., prefer dataset-level cache:
+                #       datasets/SPECT229/<patient>/bm3d_cache/<label>_<md5>_bm3d.npy
+                #    This allows all experiments to reuse the same BM3D results without YAML changes.
+                # 2) Else, fall back to experiment-local cache:
+                #       experiments/<name>/cache/bm3d/<md5>_bm3d.npy
+                #
+                # NOTE: We include dose label in the key so different rows do not collide.
+                bm3d_cache_dir = None
+                try:
+                    lp0 = str(lq_path).split("__")[0]
+                    lp_obj = Path(lp0)
+                    # If the projection file exists, use its parent as patient_dir.
+                    # If not, still try to infer patient_dir from the path parts.
+                    if lp_obj.exists():
+                        patient_dir = lp_obj.parent
+                    else:
+                        patient_dir = lp_obj.parent
+                    if "datasets" in patient_dir.parts and "SPECT229" in patient_dir.parts:
+                        ds_cache_dir = patient_dir / "bm3d_cache"
+                        if ds_cache_dir.exists():
+                            bm3d_cache_dir = ds_cache_dir
+                except Exception:
+                    bm3d_cache_dir = None
+
+                if bm3d_cache_dir is None:
+                    bm3d_cache_root = val_opt.get("bm3d_cache_root", None)
+                    if bm3d_cache_root is None or str(bm3d_cache_root).strip() in ["", "~", "null", "none"]:
+                        bm3d_cache_dir = Path("experiments") / exp_name / "cache" / "bm3d"
+                    else:
+                        bm3d_cache_dir = Path(str(bm3d_cache_root).format(name=exp_name))
+
+                # Prefer readable BM3D cache first (seed-scoped), then fallback to md5 cache via _load_or_compute_bm3d.
+                den_bm3d = None
+                try:
+                    lp0 = str(lq_path).split("__")[0]
+                    pdir = Path(lp0).parent
+                    cand_root = pdir / "bm3d_cache"
+                    if cand_root.exists():
+                        seed_dir = cand_root / f"seed{int(seed)}"
+                        ds_dir = seed_dir if seed_dir.exists() else cand_root
+                        readable = ds_dir / f"{label}_bm3d.npy"
+                        if readable.exists():
+                            den_bm3d = np.load(readable).astype(np.float32, copy=False)
+                except Exception:
+                    den_bm3d = None
+                if den_bm3d is None:
+                    den_bm3d = self._load_or_compute_bm3d(orig, bm3d_cache_dir, lq_path=(lq_path + f"__{label}"))
+                den_bm3d = np.clip(den_bm3d.astype(np.float32, copy=False), 0.0, None)
+                # Poisson from EMA output (count domain)
+                poi = np.random.default_rng(seed + int(round(float(k) * 1000.0))).poisson(lam=den_ema).astype(np.float32)
+                res_ans = (_anscombe_forward(orig) - _anscombe_forward(den_ema)).astype(np.float32, copy=False)
+                rows.append(
+                    dict(
+                        label=label,
+                        k=float(k),
+                        sec=_sec(label, k),
+                        orig=orig,
+                        bm3d=den_bm3d,
+                        g=den_g,
+                        ema=den_ema,
+                        poi=poi,
+                        res_ans=res_ans,
+                        theory=(c20 / max(float(k), 1e-12)),
+                    )
+                )
+
+            ema20 = None
+            for r in rows:
+                if r["label"] == "20s":
+                    ema20 = r["ema"]
+                    break
+            if ema20 is None:
+                ema20 = rows[0]["ema"]
+
+            diffs = []
+            for r in rows:
+                r["diff_cnt"] = (r["ema"] * float(r["k"]) - ema20).astype(np.float32, copy=False)
+                r["c_orig"] = float(np.sum(_counts_int(r["orig"]).astype(np.float64, copy=False)))
+                r["c_bm3d"] = float(np.sum(_counts_int(r["bm3d"]).astype(np.float64, copy=False)))
+                r["c_g"] = float(np.sum(_counts_int(r["g"]).astype(np.float64, copy=False)))
+                r["c_ema"] = float(np.sum(r["ema"].astype(np.float64, copy=False)))
+                r["c_poi"] = float(np.sum(_counts_int(r["poi"]).astype(np.float64, copy=False)))
+                diffs.append(np.abs(r["res_ans"]).reshape(-1))
+                diffs.append(np.abs(r["diff_cnt"]).reshape(-1))
+            flat = np.concatenate(diffs, axis=0) if diffs else np.array([1.0], dtype=np.float32)
+            dv = float(np.percentile(flat, 99.5))
+            if dv < 1e-6:
+                dv = 1.0
+
+            # ---- render frames ----
+            W, H = 128, 128
+            header_h = 22
+            font = _load_font(12)
+            col_labels = ["Original", "BM3D", "Denoised(g)", "Denoised(ema)", "Poisson(ema)", "Res(ans)", "EMA diff"]
+
+            def _g2rgb(u8: np.ndarray) -> Image.Image:
+                return Image.fromarray(np.repeat(u8[:, :, None], 3, axis=2), mode="RGB")
+
+            frames = []
+            vi_iter = range(60)
+            if mp4_tqdm:
+                vi_iter = tqdm(
+                    vi_iter,
+                    total=60,
+                    desc=f"mp4-views[{Path(sample_dir).name}]",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+            for vi in vi_iter:
+                row_imgs = []
+                for r in rows:
+                    k = float(r["k"])
+                    a = _norm_to_u8(r["orig"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
+                    b = _norm_to_u8(r["bm3d"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
+                    c = _norm_to_u8(r["g"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
+                    d = _norm_to_u8(r["ema"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
+                    e = _norm_to_u8(r["poi"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
+                    f = _signed_to_bwr(r["res_ans"][vi], vmax=dv)
+                    g = _signed_to_bwr(r["diff_cnt"][vi], vmax=dv)
+
+                    row_canvas = Image.new("RGB", (W * 7, H), color=(0, 0, 0))
+                    row_canvas.paste(_g2rgb(a), (0 * W, 0))
+                    row_canvas.paste(_g2rgb(b), (1 * W, 0))
+                    row_canvas.paste(_g2rgb(c), (2 * W, 0))
+                    row_canvas.paste(_g2rgb(d), (3 * W, 0))
+                    row_canvas.paste(_g2rgb(e), (4 * W, 0))
+                    row_canvas.paste(Image.fromarray(f, mode="RGB"), (5 * W, 0))
+                    row_canvas.paste(Image.fromarray(g, mode="RGB"), (6 * W, 0))
+
+                    draw = ImageDraw.Draw(row_canvas)
+                    # Original column: put row label + ORIGINAL total counts on ONE line, separated by ｜,
+                    # and only show integer W (no %).
+                    if str(r["label"]).startswith("x"):
+                        row_label = f"{r['sec']:.0f}s(x{k:g})"
+                    else:
+                        row_label = f"{r['sec']:.0f}s"
+                    draw.text((4, 4), f"{row_label}｜{_fmt_w_int(float(r['c_orig']))}", fill=255, font=font)
+                    t = float(r["theory"])
+                    draw.text((1 * W + 4, 4), _fmt_counts_w_pct(float(r["c_bm3d"]), t), fill=255, font=font)
+                    draw.text((2 * W + 4, 4), _fmt_counts_w_pct(float(r["c_g"]), t), fill=255, font=font)
+                    draw.text((3 * W + 4, 4), _fmt_counts_w_pct(float(r["c_ema"]), t), fill=255, font=font)
+                    draw.text((4 * W + 4, 4), _fmt_counts_w_pct(float(r["c_poi"]), t), fill=255, font=font)
+                    row_imgs.append(row_canvas)
+
+                full = Image.new("RGB", (W * 7, header_h + H * len(row_imgs)), color=(0, 0, 0))
+                draw = ImageDraw.Draw(full)
+                for j, lab in enumerate(col_labels):
+                    draw.text((j * W + 4, 3), lab, fill=255, font=font)
+                draw.text((W * 7 - 220, 3), f"view={vi:02d}  diff_vmax={dv:.3g}", fill=255, font=font)
+                for i, im in enumerate(row_imgs):
+                    full.paste(im, (0, header_h + i * H))
+                frames.append(full)
+
+            # ---- write mp4 ----
+            Path(sample_dir).mkdir(parents=True, exist_ok=True)
+            mp4_name = f"{exp_name}_iter{int(current_iter)}_{net_tag}_thin2345.mp4"
+            mp4_path = osp.join(sample_dir, mp4_name)
+            with imageio.get_writer(
+                str(mp4_path),
+                format="FFMPEG",
+                fps=float(fps) if float(fps) > 0 else 10.0,
+                codec="libx264",
+                # Avoid imageio auto-resize to macro_block_size=16.
+                # We control compatibility ourselves and prefer keeping exact pixels for analysis.
+                macro_block_size=1,
+                # yuv420p is broadly compatible; keep only one pix_fmt to avoid ffmpeg warning.
+                ffmpeg_params=["-crf", str(int(crf)), "-pix_fmt", "yuv420p"],
+            ) as w:
+                for fr in frames:
+                    w.append_data(np.asarray(fr.convert("RGB")))
+            return str(mp4_path)
+        except Exception as e:
+            self.logger.warning(f"[val] Error generating MP4: {e}", exc_info=True)
+            return None
+
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         """
         Override validation to generate GIFs for 3D data.
@@ -1133,10 +1737,19 @@ class SPECT3DModel(SRModel):
         # Merge: datasets.val takes priority for dataset-specific settings
         merged_val_opt = {**val_opt, **datasets_val_opt}
 
-        generate_gif = merged_val_opt.get('generate_gif', False)
+        generate_gif = bool(merged_val_opt.get('generate_gif', False))
+        generate_mp4_thin = bool(merged_val_opt.get('generate_mp4_thin_factors', False))
 
-        # If GIF generation is disabled, use standard validation
-        if not generate_gif:
+        # Metrics / best checkpoint are handled here when generate_gif is enabled (because we bypass SRModel's 2D logic).
+        with_metrics = merged_val_opt.get('metrics') is not None
+        dataset_name = dataloader.dataset.opt['name']
+        eval_networks = merged_val_opt.get('eval_networks', None)
+        if eval_networks is None:
+            eval_networks = ['ema'] if hasattr(self, 'net_g_ema') else ['g']
+        eval_networks = [str(x).lower() for x in eval_networks]
+
+        # If neither GIF nor MP4 visualization is enabled, use standard SRModel validation.
+        if (not generate_gif) and (not generate_mp4_thin):
             return super().nondist_validation(dataloader, current_iter, tb_logger, save_img)
 
         # Check if this is 3D data validation
@@ -1150,13 +1763,11 @@ class SPECT3DModel(SRModel):
             exp_name = self.opt.get('name', 'unknown')
             gif_output_dir = gif_output_dir.format(name=exp_name)
 
-        # For 3D projection data, skip standard validation (which expects 2D images)
-        # and directly generate GIFs
-
-        eval_networks = merged_val_opt.get('eval_networks', None)
-        if eval_networks is None:
-            eval_networks = ['ema'] if hasattr(self, 'net_g_ema') else ['g']
-        eval_networks = [str(x).lower() for x in eval_networks]
+        mp4_output_dir = merged_val_opt.get('mp4_output_dir', None)
+        if mp4_output_dir is None:
+            mp4_output_dir = f'experiments/{exp_name}/visualization/mp4s'
+        else:
+            mp4_output_dir = str(mp4_output_dir).format(name=exp_name)
 
         # Only generate GIF for the first network to save time
         net_tag = eval_networks[0]
@@ -1190,9 +1801,51 @@ class SPECT3DModel(SRModel):
                 self.logger.warning(f"Invalid poisson_calibration_opt, disabled. Reason: {e}")
                 poisson_calib_ctx = None
 
+        # ---- init metrics containers (per SRModel style, with suffixed keys) ----
+        if with_metrics:
+            metric_names = list((merged_val_opt.get('metrics') or {}).keys())
+            metric_keys = [f'{m}_{tag}' for tag in eval_networks for m in metric_names]
+            if not hasattr(self, 'metric_results'):
+                self.metric_results = {k: 0.0 for k in metric_keys}
+            self._initialize_best_metric_results(dataset_name)
+            record = self.best_metric_results[dataset_name]
+            for tag in eval_networks:
+                for m, content in (merged_val_opt.get('metrics') or {}).items():
+                    key = f'{m}_{tag}'
+                    if key in record:
+                        continue
+                    better = (content or {}).get('better', 'higher')
+                    init_val = float('-inf') if better == 'higher' else float('inf')
+                    record[key] = dict(better=better, val=init_val, iter=-1)
+            self.metric_results = {k: 0.0 for k in self.metric_results}
+            metric_count = 0
+
+        # ---- realtime progress (useful to diagnose "not reached val" vs "val stuck") ----
+        # Enable by default in debug runs; can be enabled explicitly via `val.val_tqdm: true`.
+        use_val_tqdm = bool(merged_val_opt.get("val_tqdm", ("debug" in str(self.opt.get("name", "")).lower())))
+        try:
+            total_val = len(dataloader)
+        except Exception:
+            total_val = None
+
+        self.logger.info(
+            f"[val] Start validation: dataset={dataset_name} iter={int(current_iter)} "
+            f"mode={'mp4_thin' if generate_mp4_thin else 'gif'} "
+            f"max_vis={merged_val_opt.get('max_gifs_per_val', 3)} total={total_val if total_val is not None else '?'}"
+        )
+
         num_gifs = 0
         sample_idx = 0  # Global sample index across all batches
-        for idx, val_data in enumerate(dataloader):
+        base_iter = enumerate(dataloader)
+        if use_val_tqdm:
+            base_iter = tqdm(
+                base_iter,
+                total=total_val,
+                desc=f"val[{dataset_name}] iter{int(current_iter)}",
+                leave=False,
+                dynamic_ncols=True,
+            )
+        for idx, val_data in base_iter:
             # Handle different data formats
             # SPECTProjectionDataset returns numpy arrays, standard datasets return tensors
             if isinstance(val_data.get('lq'), np.ndarray):
@@ -1224,6 +1877,20 @@ class SPECT3DModel(SRModel):
                 if not is_3d:
                     continue  # Skip 2D data
 
+                # ---- metrics: LPIPS mean (original vs Poisson(EMA output)) with GPU batching ----
+                if with_metrics:
+                    try:
+                        # Only support custom metric type(s) we define for SPECT.
+                        # Currently: lpips_poisson_mean
+                        # NOTE: We compute using the SAME inference path as GIF generation (so A is original projection).
+                        # To avoid duplicating inference logic, we reuse the denoised_ema computed in _generate_validation_gif
+                        # by re-running the minimal forward here (still cheap relative to 100x LPIPS).
+                        #
+                        # We keep it robust: if anything fails for this sample, skip.
+                        pass
+                    except Exception:
+                        pass
+
                 # Generate GIF with experiment name to avoid conflicts
                 # Use per-sample subdirectory to avoid overwriting
                 # ⭐ FIX: Use sample_idx to ensure unique directory names for each sample
@@ -1233,7 +1900,7 @@ class SPECT3DModel(SRModel):
                 exp_name = self.opt.get('name', 'unknown')
 
                 # Create subdirectory for each sample to avoid overwriting
-                sample_dir = osp.join(gif_output_dir, img_name)
+                sample_dir = osp.join(mp4_output_dir if generate_mp4_thin else gif_output_dir, img_name)
                 os.makedirs(sample_dir, exist_ok=True)
 
                 gif_name = f"{exp_name}_iter{current_iter}_{net_tag}.gif"
@@ -1242,29 +1909,58 @@ class SPECT3DModel(SRModel):
                 # Increment sample index for next sample
                 sample_idx += 1
 
-                # Check if GIF already exists (skip if exists to avoid re-generation)
-                if osp.exists(gif_path):
-                    self.logger.info(f'GIF already exists, skipping: {osp.basename(gif_path)}')
-                    num_gifs += 1
-                    if num_gifs >= merged_val_opt.get('max_gifs_per_val', 3):
-                        break
-                    continue
-
-                result = self._generate_validation_gif(
-                    val_data=one,
-                    output_path=gif_path,
-                    current_iter=current_iter,
-                    net_tag=net_tag,
-                    tb_logger=tb_logger,
-                    val_opt=merged_val_opt,
-                    poisson_calib_ctx=poisson_calib_ctx,
-                )
-
-                if result:
-                    num_gifs += 1
-                    self.logger.info(f'Generated GIF {num_gifs}/{merged_val_opt.get("max_gifs_per_val", 3)}: {osp.basename(gif_path)}')
+                if generate_mp4_thin:
+                    mp4_name = f"{exp_name}_iter{int(current_iter)}_{net_tag}_thin2345.mp4"
+                    mp4_path = osp.join(sample_dir, mp4_name)
+                    if osp.exists(mp4_path):
+                        self.logger.info(f'MP4 already exists, skipping: {osp.basename(mp4_path)}')
+                        num_gifs += 1
+                        if num_gifs >= merged_val_opt.get('max_gifs_per_val', 3):
+                            break
+                        continue
+                    self.logger.info(
+                        f"[val][mp4] Start: sample={img_name} iter={int(current_iter)} "
+                        f"factors={merged_val_opt.get('mp4_thin_factors', [2, 3, 4, 5])}"
+                    )
+                    result = self._generate_validation_mp4_thin_factors(
+                        val_data=one,
+                        sample_dir=sample_dir,
+                        exp_name=exp_name,
+                        current_iter=int(current_iter),
+                        net_tag=net_tag,
+                        tb_logger=tb_logger,
+                        val_opt=merged_val_opt,
+                        poisson_calib_ctx=poisson_calib_ctx,
+                    )
+                    if result:
+                        num_gifs += 1
+                        self.logger.info(f'Generated MP4 {num_gifs}/{merged_val_opt.get("max_gifs_per_val", 3)}: {osp.basename(result)}')
+                    else:
+                        self.logger.warning(f'Failed to generate MP4: {osp.basename(mp4_path)}')
                 else:
-                    self.logger.warning(f'Failed to generate GIF: {osp.basename(gif_path)}')
+                    # Check if GIF already exists (skip if exists to avoid re-generation)
+                    if osp.exists(gif_path):
+                        self.logger.info(f'GIF already exists, skipping: {osp.basename(gif_path)}')
+                        num_gifs += 1
+                        if num_gifs >= merged_val_opt.get('max_gifs_per_val', 3):
+                            break
+                        continue
+
+                    result = self._generate_validation_gif(
+                        val_data=one,
+                        output_path=gif_path,
+                        current_iter=current_iter,
+                        net_tag=net_tag,
+                        tb_logger=tb_logger,
+                        val_opt=merged_val_opt,
+                        poisson_calib_ctx=poisson_calib_ctx,
+                    )
+
+                    if result:
+                        num_gifs += 1
+                        self.logger.info(f'Generated GIF {num_gifs}/{merged_val_opt.get("max_gifs_per_val", 3)}: {osp.basename(gif_path)}')
+                    else:
+                        self.logger.warning(f'Failed to generate GIF: {osp.basename(gif_path)}')
 
                 # Limit number of GIFs per validation to avoid excessive I/O
                 if num_gifs >= merged_val_opt.get('max_gifs_per_val', 3):
@@ -1273,8 +1969,166 @@ class SPECT3DModel(SRModel):
             if num_gifs >= merged_val_opt.get('max_gifs_per_val', 3):
                 break
 
+        self.logger.info(f"[val] End validation: generated={num_gifs}")
         if num_gifs > 0:
             self.logger.info(f"✅ Generated {num_gifs} GIF(s) at iter {current_iter}")
+
+        # ---- compute / log metrics & optionally save best ----
+        if with_metrics:
+            try:
+                # We compute metric(s) by re-running a lightweight inference per sample
+                # (no BM3D/no GIF rendering) and then running batch LPIPS sampling.
+                def _is_3d_net(net: torch.nn.Module) -> bool:
+                    try:
+                        for m in net.modules():
+                            if isinstance(m, torch.nn.Conv3d) or isinstance(m, torch.nn.ConvTranspose3d):
+                                return True
+                    except Exception:
+                        pass
+                    return False
+
+                def _infer_denoised(net: torch.nn.Module, proj_u16: np.ndarray, val_opt: dict) -> np.ndarray:
+                    # Determine infer_mode auto/pair60_stitch.
+                    infer_mode = str(val_opt.get('infer_mode', '')).strip().lower()
+                    network_g_opt0 = self.opt.get('network_g', {}) or {}
+                    net_in0 = int(network_g_opt0.get('in_nc', 1))
+                    net_out0 = int(network_g_opt0.get('out_nc', 1))
+                    if infer_mode in ['', 'auto']:
+                        if proj_u16.ndim == 3 and proj_u16.shape[0] == 60 and net_in0 == 2 and net_out0 == 2:
+                            infer_mode = 'pair60_stitch'
+                        else:
+                            infer_mode = ''
+
+                    ds_train_opt = (self.opt.get('datasets', {}) or {}).get('train', {}) or {}
+                    max_value_train = float((val_opt or {}).get('max_value', ds_train_opt.get('max_value', 150.0)))
+                    if max_value_train < 1e-6:
+                        max_value_train = 1.0
+                    device = next(net.parameters()).device
+
+                    def _denoise_2d_per_view() -> np.ndarray:
+                        mv = float(max_value_train)
+                        out = np.zeros_like(proj_u16, dtype=np.float32)
+                        net.eval()
+                        with torch.no_grad():
+                            for i in range(int(proj_u16.shape[0])):
+                                proj_i = proj_u16[i].astype(np.float32, copy=False)
+                                xt = torch.from_numpy((proj_i / mv)[None, None, ...]).to(device=device, dtype=torch.float32)
+                                yt = net(xt)
+                                yt = torch.clamp(yt, min=0.0)
+                                out[i] = yt[0, 0].detach().cpu().numpy().astype(np.float32, copy=False) * mv
+                        return out
+
+                    def _denoise_3d_volume() -> np.ndarray:
+                        mv = float(max_value_train)
+                        x = (proj_u16 / mv).astype(np.float32, copy=False)
+                        xt = torch.from_numpy(x[None, None, ...]).to(device=device, dtype=torch.float32)  # (1,1,V,H,W)
+                        net.eval()
+                        yt = net(xt)
+                        yt = torch.clamp(yt, min=0.0)
+                        y = yt[0, 0].detach().cpu().numpy().astype(np.float32, copy=False) * mv
+                        return y
+
+                    if infer_mode == 'pair60_stitch':
+                        posterior_flip = bool(val_opt.get('posterior_flip', True))
+                        pair_bs = int(val_opt.get('pair60_stitch_batch', val_opt.get('metric_infer_batch', 4)))
+                        return self._denoise_pair60_stitch(proj_u16, net, max_value_train, device, pair_bs=pair_bs, posterior_flip=posterior_flip)
+                    return _denoise_3d_volume() if _is_3d_net(net) else _denoise_2d_per_view()
+
+                # Iterate again (cheap dataset) to compute metrics on up to val_metric_max_files (default: all)
+                max_files = int(merged_val_opt.get('metric_max_files', -1))
+                if max_files == 0:
+                    max_files = -1
+
+                metric_count = 0
+                for val_data in dataloader:
+                    # extract proj (same logic as GIF: look for proj_sequence/lq)
+                    proj_data = None
+                    for key in ['proj_sequence', 'lq']:
+                        if key in val_data:
+                            data = val_data[key]
+                            if isinstance(data, torch.Tensor):
+                                if data.dim() == 4:
+                                    proj_data = data[0].cpu().numpy()
+                                elif data.dim() == 3:
+                                    proj_data = data.cpu().numpy()
+                                break
+                            if isinstance(data, np.ndarray):
+                                proj_data = data
+                                break
+                    if proj_data is None:
+                        continue
+                    proj_u16 = proj_data.astype(np.float32, copy=False)
+                    if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
+                        continue
+
+                    # compute per network tag
+                    for tag in eval_networks:
+                        net = self.net_g_ema if (tag == 'ema' and hasattr(self, 'net_g_ema')) else self.net_g
+                        den = _infer_denoised(net, proj_u16, merged_val_opt)
+                        den = np.clip(den.astype(np.float32, copy=False), 0.0, None)
+
+                        for m, opt_ in (merged_val_opt.get('metrics') or {}).items():
+                            opt_type = str((opt_ or {}).get('type', '')).strip().lower()
+                            if opt_type != 'lpips_poisson_mean':
+                                continue
+                            lpips_net = str((opt_ or {}).get('lpips_net', 'alex')).lower()
+                            repeats = int((opt_ or {}).get('repeats', merged_val_opt.get(f'lpips_poisson_repeats_{lpips_net}', 100)))
+                            mv = float((opt_ or {}).get('max_value', merged_val_opt.get('lpips_max_value', 150.0)))
+                            batch = int((opt_ or {}).get('batch', merged_val_opt.get('lpips_poisson_batch', 4)))
+                            view_chunk = int((opt_ or {}).get('view_chunk', merged_val_opt.get('lpips_poisson_view_chunk', 10)))
+                            view_stride = int((opt_ or {}).get('view_stride', merged_val_opt.get('lpips_view_stride', 1)))
+                            dev = next(net.parameters()).device
+                            val = self._lpips_poisson_vs_original_mean_batch(
+                                orig_count=proj_u16,
+                                denoised_lambda_count=den,
+                                lpips_net=lpips_net,
+                                repeats=repeats,
+                                max_value=mv,
+                                batch=batch,
+                                view_chunk=view_chunk,
+                                view_stride=view_stride,
+                                device=torch.device(dev),
+                            )
+                            self.metric_results[f'{m}_{tag}'] += float(val)
+
+                    metric_count += 1
+                    if max_files > 0 and metric_count >= max_files:
+                        break
+
+                # reduce mean
+                for k in list(self.metric_results.keys()):
+                    if k.split('_')[-1] in eval_networks:  # only the suffixed metrics
+                        self.metric_results[k] /= float(max(metric_count, 1))
+                        base_name = '_'.join(k.split('_')[:-1])
+                        tag = k.split('_')[-1]
+                        self._update_best_metric_result(dataset_name, k, self.metric_results[k], current_iter)
+
+                # Optionally save best checkpoint (same behavior as SRModel)
+                if bool(self.opt.get('val', {}).get('save_best_ckpt', False) or merged_val_opt.get('save_best_ckpt', False)):
+                    best_metric = merged_val_opt.get('best_metric', None)
+                    record = getattr(self, 'best_metric_results', {}).get(dataset_name, {})
+                    if best_metric is None:
+                        metric_names = list((merged_val_opt.get('metrics') or {}).keys())
+                        best_metric = metric_names[0] if metric_names else None
+                        if best_metric is not None and isinstance(eval_networks, list) and len(eval_networks) > 0:
+                            best_metric = f'{best_metric}_{eval_networks[0]}'
+                    else:
+                        if best_metric not in record and isinstance(eval_networks, list) and len(eval_networks) == 1:
+                            cand = f'{best_metric}_{eval_networks[0]}'
+                            if cand in record:
+                                best_metric = cand
+
+                    if best_metric in record and int(record[best_metric].get('iter', -1)) == int(current_iter):
+                        self.logger.info(f'[val] Saving best checkpoint: {best_metric} = {record[best_metric]["val"]:.6f} @ {current_iter}')
+                        if hasattr(self, 'net_g_ema'):
+                            self.save_network([self.net_g, self.net_g_ema], 'net_g', 'best', param_key=['params', 'params_ema'])
+                        else:
+                            self.save_network(self.net_g, 'net_g', 'best')
+
+                # log
+                self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
+            except Exception as e:
+                self.logger.warning(f"[val] Failed to compute LPIPS-poisson metric: {e}", exc_info=True)
 
         # Save poisson calibration plot/csv once per validation
         if isinstance(poisson_calib_ctx, dict) and poisson_calib_ctx.get('enable', False) and self.opt.get('rank', 0) == 0:

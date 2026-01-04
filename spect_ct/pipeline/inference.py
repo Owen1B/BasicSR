@@ -78,6 +78,7 @@ def denoise_views(
     proj_count: np.ndarray,
     max_value: float,
     device: str = "cuda",
+    *,
 ) -> np.ndarray:
     """推理入口：支持 2D(逐视角) 和 3D(整块 60-view volume) 两种网络。
 
