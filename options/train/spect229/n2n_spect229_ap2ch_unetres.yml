@@ -120,7 +120,8 @@ val:
   mp4_crf: 18
   mp4_log1p: true
   gif_output_dir: experiments/{name}/visualization/gifs
-  max_gifs_per_val: 3
+  # Note: this also limits MP4 count in SPECT3DModel validation.
+  max_gifs_per_val: 4
   infer_mode: auto            # auto | paired2ch | pair60_stitch
   max_value: 150.0            # fixed normalization for inference (must match training)
   # Save best checkpoint based on a validation metric (writes net_g_best.pth + EMA params_ema).

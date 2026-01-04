@@ -112,7 +112,8 @@ val:
   mp4_fps: 10
   mp4_crf: 18
   mp4_log1p: true
-  max_gifs_per_val: 3
+  # Note: this also limits MP4 count in SPECT3DModel validation.
+  max_gifs_per_val: 4
   # Save best checkpoint based on a validation metric (writes net_g_best.pth + EMA params_ema).
   save_best_ckpt: true
   best_metric: lpips_poisson_mean_alex_ema

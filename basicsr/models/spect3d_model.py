@@ -1600,7 +1600,8 @@ class SPECT3DModel(SRModel):
             if ema20 is None:
                 ema20 = rows[0]["ema"]
 
-            diffs = []
+            diffs_res = []
+            diffs_diff = []
             for r in rows:
                 r["diff_cnt"] = (r["ema"] * float(r["k"]) - ema20).astype(np.float32, copy=False)
                 r["c_orig"] = float(np.sum(_counts_int(r["orig"]).astype(np.float64, copy=False)))
@@ -1608,12 +1609,16 @@ class SPECT3DModel(SRModel):
                 r["c_g"] = float(np.sum(_counts_int(r["g"]).astype(np.float64, copy=False)))
                 r["c_ema"] = float(np.sum(r["ema"].astype(np.float64, copy=False)))
                 r["c_poi"] = float(np.sum(_counts_int(r["poi"]).astype(np.float64, copy=False)))
-                diffs.append(np.abs(r["res_ans"]).reshape(-1))
-                diffs.append(np.abs(r["diff_cnt"]).reshape(-1))
-            flat = np.concatenate(diffs, axis=0) if diffs else np.array([1.0], dtype=np.float32)
-            dv = float(np.percentile(flat, 99.5))
-            if dv < 1e-6:
-                dv = 1.0
+                diffs_res.append(np.abs(r["res_ans"]).reshape(-1))
+                diffs_diff.append(np.abs(r["diff_cnt"]).reshape(-1))
+            flat_res = np.concatenate(diffs_res, axis=0) if diffs_res else np.array([1.0], dtype=np.float32)
+            flat_diff = np.concatenate(diffs_diff, axis=0) if diffs_diff else np.array([1.0], dtype=np.float32)
+            dv_res = float(np.percentile(flat_res, 99.5))
+            dv_diff = float(np.percentile(flat_diff, 99.5))
+            if dv_res < 1e-6:
+                dv_res = 1.0
+            if dv_diff < 1e-6:
+                dv_diff = 1.0
 
             # ---- render frames ----
             W, H = 128, 128
@@ -1643,8 +1648,8 @@ class SPECT3DModel(SRModel):
                     c = _norm_to_u8(r["g"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
                     d = _norm_to_u8(r["ema"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
                     e = _norm_to_u8(r["poi"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
-                    f = _signed_to_bwr(r["res_ans"][vi], vmax=dv)
-                    g = _signed_to_bwr(r["diff_cnt"][vi], vmax=dv)
+                    f = _signed_to_bwr(r["res_ans"][vi], vmax=dv_res)
+                    g = _signed_to_bwr(r["diff_cnt"][vi], vmax=dv_diff)
 
                     row_canvas = Image.new("RGB", (W * 7, H), color=(0, 0, 0))
                     row_canvas.paste(_g2rgb(a), (0 * W, 0))
@@ -1656,13 +1661,13 @@ class SPECT3DModel(SRModel):
                     row_canvas.paste(Image.fromarray(g, mode="RGB"), (6 * W, 0))
 
                     draw = ImageDraw.Draw(row_canvas)
-                    # Original column: put row label + ORIGINAL total counts on ONE line, separated by ｜,
+                    # Original column: put row label + ORIGINAL total counts on ONE line (avoid fullwidth '｜' which may not render).
                     # and only show integer W (no %).
                     if str(r["label"]).startswith("x"):
                         row_label = f"{r['sec']:.0f}s(x{k:g})"
                     else:
                         row_label = f"{r['sec']:.0f}s"
-                    draw.text((4, 4), f"{row_label}｜{_fmt_w_int(float(r['c_orig']))}", fill=255, font=font)
+                    draw.text((4, 4), f"{row_label} / {_fmt_w_int(float(r['c_orig']))}", fill=255, font=font)
                     t = float(r["theory"])
                     draw.text((1 * W + 4, 4), _fmt_counts_w_pct(float(r["c_bm3d"]), t), fill=255, font=font)
                     draw.text((2 * W + 4, 4), _fmt_counts_w_pct(float(r["c_g"]), t), fill=255, font=font)
@@ -1674,7 +1679,7 @@ class SPECT3DModel(SRModel):
                 draw = ImageDraw.Draw(full)
                 for j, lab in enumerate(col_labels):
                     draw.text((j * W + 4, 3), lab, fill=255, font=font)
-                draw.text((W * 7 - 220, 3), f"view={vi:02d}  diff_vmax={dv:.3g}", fill=255, font=font)
+                draw.text((W * 7 - 310, 3), f"view={vi:02d}  res_vmax={dv_res:.3g}  diff_vmax={dv_diff:.3g}", fill=255, font=font)
                 for i, im in enumerate(row_imgs):
                     full.paste(im, (0, header_h + i * H))
                 frames.append(full)
@@ -1691,8 +1696,10 @@ class SPECT3DModel(SRModel):
                 # Avoid imageio auto-resize to macro_block_size=16.
                 # We control compatibility ourselves and prefer keeping exact pixels for analysis.
                 macro_block_size=1,
-                # yuv420p is broadly compatible; keep only one pix_fmt to avoid ffmpeg warning.
-                ffmpeg_params=["-crf", str(int(crf)), "-pix_fmt", "yuv420p"],
+                # yuv420p is broadly compatible. Use writer arg instead of raw "-pix_fmt"
+                # to avoid "Multiple -pix_fmt options specified" warnings from ffmpeg.
+                pixelformat="yuv420p",
+                ffmpeg_params=["-crf", str(int(crf))],
             ) as w:
                 for fr in frames:
                     w.append_data(np.asarray(fr.convert("RGB")))
