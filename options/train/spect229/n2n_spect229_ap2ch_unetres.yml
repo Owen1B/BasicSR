@@ -146,6 +146,11 @@ val:
       lpips_net: alex
       repeats: 100
       max_value: 150.0
+    pll_mean:
+      type: pll
+      better: lower
+      full: true
+      eps: 1.0e-08
   # Persist best metric bookkeeping across restarts (auto_resume) so the run "remembers" previous best.
   persist_best_metrics: true
 

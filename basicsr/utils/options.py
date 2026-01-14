@@ -102,7 +102,8 @@ def parse_options(root_path, is_train=True):
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none', help='job launcher')
     parser.add_argument('--auto_resume', action='store_true')
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--local_rank', type=int, default=0)
+    # Compat with torchrun (uses --local-rank) and legacy launcher (uses --local_rank).
+    parser.add_argument('--local_rank', '--local-rank', dest='local_rank', type=int, default=0)
     parser.add_argument(
         '--force_yml', nargs='+', default=None, help='Force to update yml files. Examples: train:ema_decay=0.999')
     args = parser.parse_args()

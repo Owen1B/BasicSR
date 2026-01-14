@@ -1,17 +1,15 @@
-# Mixed-dose N2N + weak regularization (teacher-student under Poisson corruption)
+# L-size "fixed-dose" N2N training on 60-view full-volume 3D UNet (from scratch, k=2 only)
+# - Same as L_scratch, but ONLY one dose factor is sampled during training.
+# - Fixed: k = 2. (If you want another single k, edit n2n_k_choices.)
 #
-# Base: multidose N2N (k in {2,3,4,5}) with same-dose two-split thinning.
-# Weak constraint: SPECT3DConsistencyModel.lowdose_opt
-#   - Teacher = EMA(x)
-#   - Create synthetic lower-dose observation by scaling teacher rate and Poisson sampling
-#   - Student denoises that and matches the scaled teacher rate (in count domain)
-#
-# This pushes low-dose behavior to be consistent with the "most trusted" teacher output.
+# 2-GPU recommended launch:
+#   CUDA_VISIBLE_DEVICES=0,1 PORT=4321 \
+#   ./scripts/dist_train.sh 2 options/train/spect229/n2n_spect229_60view3d_unet_projonly_full_multidose_L_scratch_2dose.yml
 
-name: n2n_spect229_60view3d_unet_projonly_full_multidose_weakcons
-model_type: SPECT3DConsistencyModel
+name: n2n_spect229_60view3d_unet_projonly_full_multidose_L_scratch_k2
+model_type: SPECT3DModel
 scale: 1
-num_gpu: 1
+num_gpu: 2
 manual_seed: 20020113
 auto_resume: true
 
@@ -31,9 +29,9 @@ datasets:
     gt_scale_factor: 1.0
     clip_max_value: false
 
-    # Mixed-dose: sample k each item, generate two SAME-dose splits (both 20s/k)
+    # Fixed-dose N2N (same-dose two-split thinning)
     n2n_split_mode: same_dose
-    n2n_k_choices: [2, 3, 4, 5]
+    n2n_k_choices: [2]
     n2n_p: 0.5
     n2n_random_swap: false
     n2n_round: nearest
@@ -42,7 +40,7 @@ datasets:
     end_idx: 229
 
     num_worker_per_gpu: 16
-    batch_size_per_gpu: 4
+    batch_size_per_gpu: 3
     pin_memory: true
     persistent_workers: true
 
@@ -64,18 +62,15 @@ network_g:
   type: UNet3DRes
   in_nc: 1
   out_nc: 1
-  nc: [16, 32, 64, 128]
-  nb: 2
+  nc: [32, 64, 128, 256]
+  nb: 4
   bias: false
   global_residual: true
   circular_depth: true
   act: relu
 
 path:
-  # Warm-start from the best EMA checkpoint of the baseline 20s N2N run.
-  # We load params_ema into net_g (param_key_g) so fine-tuning starts from your most trusted weights.
-  pretrain_network_g: experiments/n2n_spect229_60view3d_unet_projonly_full/models/net_g_best.pth
-  param_key_g: params_ema
+  pretrain_network_g: ~
   strict_load_g: true
   resume_state: ~
 
@@ -88,11 +83,10 @@ train:
     loss_fp32: true
     use_scaler: false
   ema_decay: 0.999
-  accumulation_steps: 1
+  accumulation_steps: 2
   optim_g:
     type: AdamW
-    # Fine-tune on mixed-dose distribution: use a smaller LR than baseline.
-    lr: !!float 5e-5
+    lr: !!float 1e-4
     weight_decay: !!float 1e-4
     betas: [0.9, 0.999]
   scheduler:
@@ -112,46 +106,18 @@ train:
     max_value: 150.0
     norm_type: linear
 
-  # Weak constraint: low-dose Poisson consistency on teacher (EMA) rate
-  # Note: this adds an extra forward pass of net_g per iter.
-  consistency_opt:
-    loss_weight: 0.0   # keep off by default; enable if you want cycle-consistency too
-    start_iter: 0
-    target: g_on_input
-    use_ema_teacher: true
-    detach_target: true
-    domain: count
-    loss_type: poisson
-    max_value: 150.0
-    norm_type: linear
-
-  lowdose_opt:
-    loss_weight: 0.05
-    start_iter: 0
-    use_ema_teacher: true
-    detach_target: true
-    domain: count
-    loss_type: poisson
-    # factor s means: A = teacher/s, so s=2..5 roughly matches 10s..4s
-    factor_min: 2.0
-    factor_max: 5.0
-    per_sample: true
-    max_value: 150.0
-    norm_type: linear
-
 val:
   val_freq: 1000
   save_img: false
-  # Visualization: prefer MP4 (truecolor) over legacy GIF
   generate_gif: false
   generate_mp4_thin_factors: true
   mp4_output_dir: experiments/{name}/visualization/mp4s
-  mp4_thin_factors: [2, 3, 4, 5]
+  # Keep validation MP4 aligned with the training dose (faster val).
+  mp4_thin_factors: [2]
   mp4_thin_seed: 123
   mp4_fps: 10
   mp4_crf: 18
   mp4_log1p: true
-  # Note: this also limits MP4 count in SPECT3DModel validation.
   max_gifs_per_val: 4
   save_best_ckpt: true
   best_metric: lpips_poisson_mean_alex_ema

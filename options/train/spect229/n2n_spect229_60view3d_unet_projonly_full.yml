@@ -34,7 +34,7 @@ datasets:
     end_idx: 229
 
     num_worker_per_gpu: 16
-    batch_size_per_gpu: 8
+    batch_size_per_gpu: 4
     pin_memory: true
     persistent_workers: true
 
@@ -77,7 +77,7 @@ train:
     loss_fp32: true
     use_scaler: false
   ema_decay: 0.999
-  accumulation_steps: 2  # no grad accumulation
+  accumulation_steps: 1  # disable grad accumulation
   optim_g:
     type: AdamW
     lr: !!float 1e-4
@@ -145,6 +145,11 @@ val:
       lpips_net: alex
       repeats: 100
       max_value: 150.0
+    pll_mean:
+      type: pll
+      better: lower
+      full: true
+      eps: 1.0e-08
   # Persist best metric bookkeeping across restarts (auto_resume) so the run "remembers" previous best.
   persist_best_metrics: true
 

@@ -43,6 +43,108 @@ class SPECT3DModel(SRModel):
         # Cache LPIPS networks across validations to avoid re-loading weights every time.
         self._lpips_cache: dict[str, torch.nn.Module] = {}
 
+    @torch.no_grad()
+    def _nondist_validation_projection_light(self, dataloader, current_iter, merged_val_opt: dict, eval_networks: list[str]):
+        """Lightweight validation/test path for SPECTProjectionDataset.
+
+        This avoids SRModel's 2D validation pipeline (which assumes 4D NCHW tensors),
+        and provides a fast way to run 3D inference (optionally with view subsampling).
+        """
+        ds_train_opt = (self.opt.get('datasets', {}) or {}).get('train', {}) or {}
+        max_value = float(merged_val_opt.get('max_value', ds_train_opt.get('max_value', 150.0)))
+        if max_value < 1e-6:
+            max_value = 1.0
+
+        # Optional: subsample views to speed up inference (e.g. 2 -> 30 views from a 60-view input)
+        try:
+            view_stride = int(merged_val_opt.get('view_stride', 1))
+        except Exception:
+            view_stride = 1
+        if view_stride < 1:
+            view_stride = 1
+
+        # Optional PLL metric (self-supervised Poisson NLL): lower is better.
+        metrics = merged_val_opt.get('metrics', None) or {}
+        want_pll = False
+        pll_key = None
+        pll_eps = 1.0e-8
+        pll_full = True
+        for m, opt_ in metrics.items():
+            opt_type = str((opt_ or {}).get('type', '')).strip().lower()
+            if opt_type in ['pll', 'pllloss', 'poisson_nll', 'poisson_nll_mean', 'poisson_nll_loss']:
+                want_pll = True
+                pll_key = str(m)
+                pll_eps = float((opt_ or {}).get('eps', 1.0e-8))
+                pll_full = bool((opt_ or {}).get('full', True))
+                break
+
+        pll_sum = {tag: 0.0 for tag in eval_networks}
+        n_used = 0
+
+        for val_data in dataloader:
+            # Extract projection: (V,H,W) in count domain (uint16 in file; here float32)
+            proj_data = None
+            for key in ['proj_sequence', 'lq']:
+                if key not in val_data:
+                    continue
+                data = val_data[key]
+                if isinstance(data, torch.Tensor):
+                    if data.dim() == 4:  # [B,V,H,W]
+                        proj_data = data[0].detach().cpu().numpy()
+                    elif data.dim() == 3:  # [V,H,W]
+                        proj_data = data.detach().cpu().numpy()
+                    break
+                if isinstance(data, np.ndarray):
+                    proj_data = data
+                    break
+            if proj_data is None:
+                continue
+            proj_u16 = np.asarray(proj_data, dtype=np.float32)
+            if not (proj_u16.ndim == 3 and int(proj_u16.shape[0]) >= 2):
+                continue
+            v_total = int(proj_u16.shape[0])
+            if view_stride > 1:
+                proj_u16 = proj_u16[::view_stride]
+            v_used = int(proj_u16.shape[0])
+
+            # One-line confirmation in logs: how many views are actually used.
+            try:
+                lq_path = val_data.get('lq_path', '')
+                if isinstance(lq_path, list):
+                    lq_path = lq_path[0] if lq_path else ''
+                sample_name = str(lq_path)
+            except Exception:
+                sample_name = ''
+            self.logger.info(f"[val][light] sample={sample_name} views_used={v_used}/{v_total} view_stride={view_stride}")
+
+            # Input: (1,1,V,H,W) normalized to [0,1]
+            x = (proj_u16 / max_value).astype(np.float32, copy=False)
+            xt = torch.from_numpy(x[None, None, ...]).to(device=self.device, dtype=torch.float32)
+
+            for tag in eval_networks:
+                net = self.net_g_ema if (tag == 'ema' and hasattr(self, 'net_g_ema')) else self.net_g
+                net.eval()
+                yt = net(xt)
+                yt = torch.clamp(yt, min=0.0)
+                den = yt[0, 0] * float(max_value)  # (V,H,W) in count domain
+
+                if want_pll:
+                    import torch.nn.functional as F
+                    y = torch.from_numpy(np.clip(np.rint(proj_u16), 0.0, None).astype(np.float32, copy=False)).to(self.device)
+                    lam = torch.clamp(den, min=float(pll_eps))
+                    # Use log_input=True with log(lam) for numerical stability and full Poisson likelihood if requested.
+                    val_pll = F.poisson_nll_loss(torch.log(lam), y, log_input=True, full=pll_full, reduction='mean')
+                    pll_sum[tag] += float(val_pll.detach().cpu().item())
+
+            n_used += 1
+
+        if want_pll and n_used > 0:
+            for tag in eval_networks:
+                v = pll_sum[tag] / float(n_used)
+                self.logger.info(f"[val][light] {pll_key}_{tag}: {v:.6g} (n={n_used}, view_stride={view_stride})")
+        else:
+            self.logger.info(f"[val][light] done (n={n_used}, view_stride={view_stride})")
+
     def _get_lpips_model(self, net: str, device: torch.device) -> Optional[torch.nn.Module]:
         """Get (and cache) LPIPS model. Returns None if lpips dependency missing."""
         name = str(net).lower().strip()
@@ -1303,8 +1405,23 @@ class SPECT3DModel(SRModel):
             if proj_data is None:
                 return None
             proj_u16 = np.asarray(proj_data, dtype=np.float32)
-            if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
+            if not (proj_u16.ndim == 3 and int(proj_u16.shape[0]) >= 2):
                 return None
+            v_total = int(proj_u16.shape[0])
+
+            # Optional: subsample views for MP4 rendering too (e.g. 2 -> 30 views from a 60-view input).
+            try:
+                view_stride = int(val_opt.get("view_stride", 1))
+            except Exception:
+                view_stride = 1
+            if view_stride < 1:
+                view_stride = 1
+            idx_views = np.arange(0, v_total, view_stride, dtype=np.int64)
+            if idx_views.size < 1:
+                idx_views = np.arange(0, v_total, 1, dtype=np.int64)
+            # Keep only selected views for the whole MP4 pipeline.
+            if view_stride > 1:
+                proj_u16 = proj_u16[idx_views]
             lq_path = val_data.get("lq_path", "")
             if isinstance(lq_path, list):
                 lq_path = lq_path[0] if lq_path else ""
@@ -1456,6 +1573,9 @@ class SPECT3DModel(SRModel):
                     # Optional fallback: generate on-the-fly (deterministic given seed)
                     xk_i = rng.binomial(y20i, 1.0 / float(k)).astype(np.int64, copy=False)
                     xk = xk_i.astype(np.float32, copy=False)
+                # If cached thins were loaded for full 60 views, subsample to match selected views.
+                if view_stride > 1 and xk is not None and xk.ndim == 3 and int(xk.shape[0]) == v_total:
+                    xk = xk[idx_views]
                 base_rows.append((lab, float(k), xk))
 
             def _sec(label: str, k: float) -> float:
@@ -1601,7 +1721,6 @@ class SPECT3DModel(SRModel):
                 ema20 = rows[0]["ema"]
 
             diffs_res = []
-            diffs_diff = []
             for r in rows:
                 r["diff_cnt"] = (r["ema"] * float(r["k"]) - ema20).astype(np.float32, copy=False)
                 r["c_orig"] = float(np.sum(_counts_int(r["orig"]).astype(np.float64, copy=False)))
@@ -1610,15 +1729,10 @@ class SPECT3DModel(SRModel):
                 r["c_ema"] = float(np.sum(r["ema"].astype(np.float64, copy=False)))
                 r["c_poi"] = float(np.sum(_counts_int(r["poi"]).astype(np.float64, copy=False)))
                 diffs_res.append(np.abs(r["res_ans"]).reshape(-1))
-                diffs_diff.append(np.abs(r["diff_cnt"]).reshape(-1))
             flat_res = np.concatenate(diffs_res, axis=0) if diffs_res else np.array([1.0], dtype=np.float32)
-            flat_diff = np.concatenate(diffs_diff, axis=0) if diffs_diff else np.array([1.0], dtype=np.float32)
             dv_res = float(np.percentile(flat_res, 99.5))
-            dv_diff = float(np.percentile(flat_diff, 99.5))
             if dv_res < 1e-6:
                 dv_res = 1.0
-            if dv_diff < 1e-6:
-                dv_diff = 1.0
 
             # ---- render frames ----
             W, H = 128, 128
@@ -1630,11 +1744,11 @@ class SPECT3DModel(SRModel):
                 return Image.fromarray(np.repeat(u8[:, :, None], 3, axis=2), mode="RGB")
 
             frames = []
-            vi_iter = range(60)
+            vi_iter = range(int(proj_u16.shape[0]))
             if mp4_tqdm:
                 vi_iter = tqdm(
                     vi_iter,
-                    total=60,
+                    total=int(proj_u16.shape[0]),
                     desc=f"mp4-views[{Path(sample_dir).name}]",
                     leave=False,
                     dynamic_ncols=True,
@@ -1648,8 +1762,9 @@ class SPECT3DModel(SRModel):
                     c = _norm_to_u8(r["g"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
                     d = _norm_to_u8(r["ema"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
                     e = _norm_to_u8(r["poi"][vi] * k, vmax=vmax20, use_log1p=use_log1p)
+                    # Res(ans) uses its OWN scale; EMA diff shares the same scale for direct visual comparison.
                     f = _signed_to_bwr(r["res_ans"][vi], vmax=dv_res)
-                    g = _signed_to_bwr(r["diff_cnt"][vi], vmax=dv_diff)
+                    g = _signed_to_bwr(r["diff_cnt"][vi], vmax=dv_res)
 
                     row_canvas = Image.new("RGB", (W * 7, H), color=(0, 0, 0))
                     row_canvas.paste(_g2rgb(a), (0 * W, 0))
@@ -1679,7 +1794,7 @@ class SPECT3DModel(SRModel):
                 draw = ImageDraw.Draw(full)
                 for j, lab in enumerate(col_labels):
                     draw.text((j * W + 4, 3), lab, fill=255, font=font)
-                draw.text((W * 7 - 310, 3), f"view={vi:02d}  res_vmax={dv_res:.3g}  diff_vmax={dv_diff:.3g}", fill=255, font=font)
+                draw.text((W * 7 - 240, 3), f"view={vi:02d}  ans_vmax={dv_res:.3g}", fill=255, font=font)
                 for i, im in enumerate(row_imgs):
                     full.paste(im, (0, header_h + i * H))
                 frames.append(full)
@@ -1737,6 +1852,12 @@ class SPECT3DModel(SRModel):
                             if match:
                                 current_iter = int(match.group(1))
 
+        # Ensure current_iter is numeric (test.py passes opt['name'] which is a string).
+        try:
+            current_iter = int(current_iter)  # type: ignore[arg-type]
+        except Exception:
+            current_iter = 0
+
         # Get validation config from datasets.val (where dataset config is) or top-level val
         val_opt = self.opt.get('val', {})
         datasets_val_opt = self.opt.get('datasets', {}).get('val', {})
@@ -1755,8 +1876,17 @@ class SPECT3DModel(SRModel):
             eval_networks = ['ema'] if hasattr(self, 'net_g_ema') else ['g']
         eval_networks = [str(x).lower() for x in eval_networks]
 
-        # If neither GIF nor MP4 visualization is enabled, use standard SRModel validation.
+        # If neither GIF nor MP4 visualization is enabled:
+        # - For projection sequences, run a lightweight 3D inference loop (optionally subsampling views).
+        # - Otherwise, fall back to standard SRModel validation.
         if (not generate_gif) and (not generate_mp4_thin):
+            try:
+                ds_opt = getattr(dataloader.dataset, 'opt', {}) or {}
+                ds_type = str(ds_opt.get('type', '')).strip().lower()
+            except Exception:
+                ds_type = ''
+            if ds_type == 'spectprojectiondataset':
+                return self._nondist_validation_projection_light(dataloader, current_iter, merged_val_opt, eval_networks)
             return super().nondist_validation(dataloader, current_iter, tb_logger, save_img)
 
         # Check if this is 3D data validation
@@ -1835,8 +1965,13 @@ class SPECT3DModel(SRModel):
         except Exception:
             total_val = None
 
+        # current_iter can be a string in test.py (it passes opt['name']). Make it robust for logging/paths.
+        try:
+            iter_i = int(current_iter)  # type: ignore[arg-type]
+        except Exception:
+            iter_i = 0
         self.logger.info(
-            f"[val] Start validation: dataset={dataset_name} iter={int(current_iter)} "
+            f"[val] Start validation: dataset={dataset_name} iter={iter_i} "
             f"mode={'mp4_thin' if generate_mp4_thin else 'gif'} "
             f"max_vis={merged_val_opt.get('max_gifs_per_val', 3)} total={total_val if total_val is not None else '?'}"
         )
@@ -1848,7 +1983,7 @@ class SPECT3DModel(SRModel):
             base_iter = tqdm(
                 base_iter,
                 total=total_val,
-                desc=f"val[{dataset_name}] iter{int(current_iter)}",
+                desc=f"val[{dataset_name}] iter{iter_i}",
                 leave=False,
                 dynamic_ncols=True,
             )
@@ -2065,8 +2200,19 @@ class SPECT3DModel(SRModel):
                     if proj_data is None:
                         continue
                     proj_u16 = proj_data.astype(np.float32, copy=False)
-                    if not (proj_u16.ndim == 3 and proj_u16.shape[0] == 60):
+                    if not (proj_u16.ndim == 3 and int(proj_u16.shape[0]) >= 2):
                         continue
+
+                    # Optional: subsample views for faster validation/test inference.
+                    # Example: view_stride=2 keeps views [0,2,4,...] -> 30 views for a 60-view volume.
+                    try:
+                        view_stride = int(merged_val_opt.get('view_stride', 1))
+                    except Exception:
+                        view_stride = 1
+                    if view_stride < 1:
+                        view_stride = 1
+                    if view_stride > 1:
+                        proj_u16 = proj_u16[::view_stride]
 
                     # compute per network tag
                     for tag in eval_networks:
@@ -2077,6 +2223,27 @@ class SPECT3DModel(SRModel):
                         for m, opt_ in (merged_val_opt.get('metrics') or {}).items():
                             opt_type = str((opt_ or {}).get('type', '')).strip().lower()
                             if opt_type != 'lpips_poisson_mean':
+                                # Support additional metrics below (e.g., pll)
+                                if opt_type not in ['pll', 'pllloss', 'poisson_nll', 'poisson_nll_mean', 'poisson_nll_loss']:
+                                    continue
+                                # Poisson NLL (PLL) between EMA denoised lambda and observed counts.
+                                # This is a self-supervised likelihood metric: lower is better.
+                                try:
+                                    import torch.nn.functional as F
+                                    eps = float((opt_ or {}).get('eps', merged_val_opt.get('pll_eps', 1e-8)))
+                                    full = bool((opt_ or {}).get('full', merged_val_opt.get('pll_full', True)))
+                                    # target: integer-ish counts
+                                    y = np.clip(np.rint(proj_u16.astype(np.float32, copy=False)), 0.0, None).astype(np.float32, copy=False)
+                                    lam = np.clip(den.astype(np.float32, copy=False), eps, None).astype(np.float32, copy=False)
+                                    dev = next(net.parameters()).device
+                                    yt = torch.from_numpy(y).to(device=dev, dtype=torch.float32)
+                                    lamt = torch.from_numpy(lam).to(device=dev, dtype=torch.float32)
+                                    lamt = torch.clamp(lamt, min=eps)
+                                    val_pll = F.poisson_nll_loss(torch.log(lamt), yt, log_input=True, full=full, reduction='mean')
+                                    self.metric_results[f'{m}_{tag}'] += float(val_pll.detach().cpu().item())
+                                except Exception:
+                                    # Skip if anything fails for this sample/metric
+                                    pass
                                 continue
                             lpips_net = str((opt_ or {}).get('lpips_net', 'alex')).lower()
                             repeats = int((opt_ or {}).get('repeats', merged_val_opt.get(f'lpips_poisson_repeats_{lpips_net}', 100)))

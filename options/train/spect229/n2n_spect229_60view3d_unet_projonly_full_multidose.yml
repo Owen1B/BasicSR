@@ -39,7 +39,7 @@ datasets:
     end_idx: 229
 
     num_worker_per_gpu: 16
-    batch_size_per_gpu: 8
+    batch_size_per_gpu: 4
     pin_memory: true
     persistent_workers: true
 
@@ -85,7 +85,7 @@ train:
     loss_fp32: true
     use_scaler: false
   ema_decay: 0.999
-  accumulation_steps: 2
+  accumulation_steps: 1
   optim_g:
     type: AdamW
     # Fine-tune on mixed-dose distribution: use a smaller LR than baseline.
@@ -147,6 +147,11 @@ val:
       lpips_net: alex
       repeats: 100
       max_value: 150.0
+    pll_mean:
+      type: pll
+      better: lower
+      full: true
+      eps: 1.0e-08
   persist_best_metrics: true
 
 logger:

@@ -197,6 +197,7 @@ class RunConfig:
     rerun_recon: bool
     mp4: bool
     mp4_only: bool
+    gif: bool
     # Synthetic low-dose inference via independent thinning from 20s (default disabled).
     synthetic_thin_factors: Optional[str]
     synthetic_thin_seed: int
@@ -381,8 +382,8 @@ def run_experiment(
         def _run_one(*, run_patient: str, in_proj: Path, orig_recon_override: Optional[Path]) -> Optional[object]:
             # Existing outputs (for skip-by-default behavior)
             patient_out = out_dir / run_patient
-            den_file = patient_out / "projections" / "denoised_projection.dat"
-            den_p_file = patient_out / "projections" / "denoised_poisson_projection.dat"
+            den_file = patient_out / "projections" / "denoised_projection_f32.dat"
+            den_p_file = patient_out / "projections" / "denoised_poisson_projection_f32.dat"
             recon_den = patient_out / "reconstructions" / f"{run_patient}_denoised_OSEMReconed_Iter{int(rc.iterations)}.dat"
             recon_poi = patient_out / "reconstructions" / f"{run_patient}_denoised_poisson_OSEMReconed_Iter{int(rc.iterations)}.dat"
             have_denoise = den_file.exists() and den_p_file.exists()
@@ -394,7 +395,7 @@ def run_experiment(
             want_mp4_any = bool(getattr(rc, "mp4", False)) or bool(getattr(rc, "mp4_only", False))
             want_mp4 = want_mp4_any and (bool(rc.overwrite) or (not mp4_path.exists()))
             # If mp4-only: never generate gif. If not mp4-only: generate gif only when missing/overwrite.
-            want_gif = (not bool(getattr(rc, "mp4_only", False))) and (bool(rc.overwrite) or (not gif_path.exists()))
+            want_gif = bool(getattr(rc, "gif", True)) and (not bool(getattr(rc, "mp4_only", False))) and (bool(rc.overwrite) or (not gif_path.exists()))
 
             # Map stage to pipeline stages (per-run)
             if stage in ["denoise", "infer"]:
@@ -481,7 +482,7 @@ def run_experiment(
                 continue
             outputs_list.append(out0)
 
-        # Projection-domain metrics (fast): compute BOTH fp32 and uint16 denoised metrics vs original.
+        # Projection-domain metrics (fast): fp32-only (no int16 artifacts).
         if rc.compute_metrics:
             try:
                 from spect_ct.pipeline.io import load_projection_f32
@@ -511,25 +512,31 @@ def run_experiment(
                 mv = float(rc.max_value)
                 for out_obj in outputs_list:
                     outputs = out_obj  # type: ignore
-                    # Original projection for this run is what pipeline saved (handles synthetic too)
-                    orig_proj = load_projection_i16(Path(outputs.proj_dir) / "original_projection.dat").astype(np.float32, copy=False)
-                    den_u16 = load_projection_i16(Path(outputs.proj_dir) / "denoised_projection.dat").astype(np.float32, copy=False)
-                    den_fp32 = (
-                        load_projection_f32(Path(outputs.proj_dir) / "denoised_projection_f32.dat").astype(np.float32, copy=False)
-                        if (Path(outputs.proj_dir) / "denoised_projection_f32.dat").exists()
-                        else den_u16
-                    )
-                    den_p = load_projection_i16(Path(outputs.proj_dir) / "denoised_poisson_projection.dat").astype(np.float32, copy=False)
+                    proj_dir = Path(outputs.proj_dir)
+                    # fp32-only layout (backward compat: fallback to legacy int16 names if present)
+                    orig_f32 = proj_dir / "original_projection_f32.dat"
+                    orig_i16 = proj_dir / "original_projection.dat"
+                    if orig_f32.exists():
+                        orig_proj = load_projection_f32(orig_f32).astype(np.float32, copy=False)
+                    else:
+                        orig_proj = load_projection_i16(orig_i16).astype(np.float32, copy=False)
+
+                    den_fp32 = load_projection_f32(proj_dir / "denoised_projection_f32.dat").astype(np.float32, copy=False)
+
+                    den_p_f32 = proj_dir / "denoised_poisson_projection_f32.dat"
+                    den_p_i16 = proj_dir / "denoised_poisson_projection.dat"
+                    if den_p_f32.exists():
+                        den_p = load_projection_f32(den_p_f32).astype(np.float32, copy=False)
+                    else:
+                        den_p = load_projection_i16(den_p_i16).astype(np.float32, copy=False)
 
                     # LPIPS
                     lp_d_fp32 = lpips_views_mean(pred=den_fp32, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
-                    lp_d_u16 = lpips_views_mean(pred=den_u16, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
                     lp_p = lpips_views_mean(pred=den_p, ref=orig_proj, max_value=float(rc.max_value), nets=("alex", "vgg"))
 
                     psnr_fp32, ssim_fp32 = _psnr_ssim_views_mean(den_fp32, orig_proj, mv)
-                    psnr_u16, ssim_u16 = _psnr_ssim_views_mean(den_u16, orig_proj, mv)
                     psnr_p, ssim_p = _psnr_ssim_views_mean(den_p, orig_proj, mv)
-                    psnr_qgap, ssim_qgap = _psnr_ssim_views_mean(den_u16, den_fp32, mv)
+                    psnr_qgap, ssim_qgap = float("nan"), float("nan")
 
                     patient_name = Path(outputs.proj_dir).parents[0].name
                     lpips_rows.append(
@@ -539,10 +546,6 @@ def run_experiment(
                             "lpips_denoised_fp32_vgg": lp_d_fp32.get("vgg", float("nan")),
                             "psnr_denoised_fp32": psnr_fp32,
                             "ssim_denoised_fp32": ssim_fp32,
-                            "lpips_denoised_u16_alex": lp_d_u16.get("alex", float("nan")),
-                            "lpips_denoised_u16_vgg": lp_d_u16.get("vgg", float("nan")),
-                            "psnr_denoised_u16": psnr_u16,
-                            "ssim_denoised_u16": ssim_u16,
                             "lpips_poisson_alex": lp_p.get("alex", float("nan")),
                             "lpips_poisson_vgg": lp_p.get("vgg", float("nan")),
                             "psnr_poisson": psnr_p,
@@ -652,6 +655,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         rerun_recon=not bool(getattr(args, "no_rerun_recon", False)),
         mp4=bool(getattr(args, "mp4", False)) or bool(getattr(args, "mp4_only", False)),
         mp4_only=bool(getattr(args, "mp4_only", False)),
+        gif=bool(getattr(args, "gif", True)),
         synthetic_thin_factors=str(getattr(args, "synthetic_thin_factors", "") or ""),
         synthetic_thin_seed=int(getattr(args, "synthetic_thin_seed", 123)),
         synthetic_include_20s=bool(getattr(args, "synthetic_include_20s", True)),
@@ -702,6 +706,7 @@ def _cmd_batch(args: argparse.Namespace) -> None:
             rerun_recon=not bool(getattr(args, "no_rerun_recon", False)),
             mp4=bool(getattr(args, "mp4", False)) or bool(getattr(args, "mp4_only", False)),
             mp4_only=bool(getattr(args, "mp4_only", False)),
+            gif=bool(getattr(args, "gif", True)),
             synthetic_thin_factors=str(getattr(args, "synthetic_thin_factors", "") or ""),
             synthetic_thin_seed=int(getattr(args, "synthetic_thin_seed", 123)),
             synthetic_include_20s=bool(getattr(args, "synthetic_include_20s", True)),
@@ -870,6 +875,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--mp4", action="store_true", help="also generate mp4 (truecolor) for each patient")
         sp.add_argument("--mp4-only", dest="mp4_only", action="store_true", help="only generate mp4 (skip gif)")
         sp.set_defaults(mp4=False, mp4_only=False)
+        sp.add_argument("--gif", action="store_true", help="generate gif visualization (default: enabled)")
+        sp.add_argument("--no-gif", dest="gif", action="store_false", help="disable gif generation (denoise only)")
+        sp.set_defaults(gif=True)
 
         # Synthetic low-dose inference via 20s thinning (default OFF).
         sp.add_argument(
@@ -915,8 +923,8 @@ def build_parser() -> argparse.ArgumentParser:
     def _cmd_recon_results(args: argparse.Namespace) -> None:
         """Run OSEM reconstructions for an existing results tree produced by denoise stage.
 
-        Expected layout:
-          <results_dir>/<patient>/projections/{original,denoised,denoised_poisson}_projection.dat
+        Expected layout (fp32-only):
+          <results_dir>/<patient>/projections/{original_projection_f32,denoised_projection_f32,denoised_poisson_projection_f32}.dat
           <results_dir>/<patient>/reconstructions/  (will be filled)
         """
         from spect_ct.pipeline.osem import run_osem_reconstruction
@@ -952,29 +960,12 @@ def build_parser() -> argparse.ArgumentParser:
             recon_dir = results_dir / patient / "reconstructions"
             recon_dir.mkdir(parents=True, exist_ok=True)
 
-            # Recon jobs:
-            # - original: int16, PrjDataType=2
-            # - denoised (uint16 cached): int16, PrjDataType=2
-            # - denoised_fp32 (if fp32 projection exists): float32, PrjDataType=1
-            # - denoised_poisson: int16, PrjDataType=2
+            # Recon jobs (fp32-only, PrjDataType=1).
             recon_jobs: list[tuple[Path, str, int]] = [
-                (proj_dir / "original_projection.dat", "original", 2),
-                (proj_dir / "denoised_projection.dat", "denoised", 2),
+                (proj_dir / "original_projection_f32.dat", "original", 1),
+                (proj_dir / "denoised_projection_f32.dat", "denoised_fp32", 1),
+                (proj_dir / "denoised_poisson_projection_f32.dat", "denoised_poisson", 1),
             ]
-            den_f32 = proj_dir / "denoised_projection_f32.dat"
-            if synth_f32 and (not den_f32.exists()):
-                # Backfill fp32 projection from the saved int16 file (NOT the original net fp32 output).
-                # Useful for testing OSEM fp32 path on existing results.
-                try:
-                    x = np.fromfile(str(proj_dir / "denoised_projection.dat"), dtype=np.int16).astype(np.float32, copy=False)
-                    # count domain: ensure non-negative + finite
-                    x = np.clip(np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
-                    x.tofile(str(den_f32))
-                except Exception:
-                    pass
-            if den_f32.exists():
-                recon_jobs.append((den_f32, "denoised_fp32", 1))
-            recon_jobs.append((proj_dir / "denoised_poisson_projection.dat", "denoised_poisson", 2))
             missing = [str(p) for p, _, _ in recon_jobs if not Path(p).exists()]
             if missing:
                 print(f"[WARN][{patient}] missing projections, skip: {missing}")
@@ -1016,7 +1007,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_recon.add_argument(
         "--synth-f32",
         action="store_true",
-        help="if denoised_projection_f32.dat is missing, synthesize it from denoised_projection.dat (int16->float32) for fp32 recon path testing",
+        help="(legacy) kept for backward compat; fp32-only layout no longer synthesizes from int16 outputs",
     )
     p_recon.set_defaults(func=_cmd_recon_results)
 

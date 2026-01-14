@@ -131,10 +131,22 @@ def main():
                         help="Random seed for Poisson thinning (default: 123)")
     parser.add_argument("--thin-factors", type=int, nargs="+", default=[2, 3, 4, 5],
                         help="Thinning factors to precompute (default: 2 3 4 5)")
+    parser.add_argument(
+        "--patients",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional: patient folder names under dataroot (overrides --val-indices). Example: --patients BaYasu BaTunasong",
+    )
     parser.add_argument("--val-indices", type=int, nargs="+", default=[0, 1, 2, 3],
                         help="Validation patient indices (default: 0 1 2 3)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing cache files")
+    parser.add_argument(
+        "--thin-only",
+        action="store_true",
+        help="Only generate and save {label}_thin.npy (skip BM3D entirely). Useful for fast mp4 thinning expansion.",
+    )
     parser.add_argument("--sigma-psd", type=float, default=1.0,
                         help="BM3D noise std in Anscombe domain (default: 1.0, recommended for Anscombe)")
     parser.add_argument("--num-workers", type=int, default=None,
@@ -157,25 +169,53 @@ def main():
     print(f"📂 Found {len(all_patients)} patient directories in {dataroot}")
     print(f"🎲 Random seed: {args.seed}")
     print(f"📊 Thinning factors: {args.thin_factors}")
+    if args.patients is not None and len(args.patients) > 0:
+        print(f"✅ Patients: {args.patients}")
+    else:
     print(f"✅ Validation indices: {args.val_indices}")
     print(f"🔧 BM3D workers: {num_workers} (CPU count: {mp.cpu_count()})")
+    if bool(args.thin_only):
+        print("⚡ thin-only: enabled (BM3D will be skipped)")
     print()
 
     total_computed = 0
     total_skipped = 0
 
-    # Calculate total tasks for progress bar
-    total_tasks = len(args.val_indices) * len(args.thin_factors)
+    # Decide patient list
+    if args.patients is not None and len(args.patients) > 0:
+        chosen_patients: list[Path] = []
+        missing: list[str] = []
+        all_by_name = {p.name: p for p in all_patients}
+        for name in args.patients:
+            p = all_by_name.get(str(name))
+            if p is None:
+                missing.append(str(name))
+            else:
+                chosen_patients.append(p)
+        if missing:
+            print(f"❌ Some patients not found under {dataroot}: {missing}")
+            return 1
+        patient_plan = [("name", p) for p in chosen_patients]
+    else:
+        patient_plan = [("idx", int(i)) for i in args.val_indices]
+
+    # Calculate total tasks for progress bar.
+    # Note: we always process k_list = [1] + thin_factors.
+    total_tasks = len(patient_plan) * (len(args.thin_factors) + 1)
 
     # Outer progress bar for overall progress
     with tqdm(total=total_tasks, desc="Overall", unit="task", position=0, leave=True) as pbar_outer:
-        for patient_idx in args.val_indices:
+        for kind, token in patient_plan:
+            if kind == "idx":
+                patient_idx = int(token)
             if patient_idx >= len(all_patients):
                 print(f"⚠️  Skipping index {patient_idx} (only {len(all_patients)} patients available)")
-                pbar_outer.update(len(args.thin_factors))
+                    pbar_outer.update(len(args.thin_factors) + 1)
                 continue
-
             patient_dir = all_patients[patient_idx]
+            else:
+                patient_dir = Path(token)
+                patient_idx = -1
             patient_name = patient_dir.name
 
             # Find 20s projection file
@@ -186,8 +226,12 @@ def main():
                 continue
 
             proj_file = proj_files[0]
+            if patient_idx >= 0:
             pbar_outer.set_description(f"Patient {patient_idx:03d}: {patient_name[:20]}")
             print(f"\n👤 Patient [{patient_idx:03d}]: {patient_name}")
+            else:
+                pbar_outer.set_description(f"Patient: {patient_name[:24]}")
+                print(f"\n👤 Patient: {patient_name}")
 
             # Load 20s projection
             try:
@@ -210,14 +254,24 @@ def main():
             # Always precompute 20s BM3D too (label '20s')
             k_list = [1] + list(args.thin_factors)
 
-            # Process each thinning factor
+            # Process each thinning factor (include 20s label)
             for k in k_list:
                 label = "20s" if int(k) == 1 else f"x{int(k)}"
                 cache_file = cache_dir / f"{label}_bm3d.npy"
                 thin_file = cache_dir / f"{label}_thin.npy"
 
+                if bool(args.thin_only):
+                    if thin_file.exists() and (not args.overwrite):
+                        print(f"   ⏭️  {label}: thin cache exists, skipping (use --overwrite to recompute)")
+                        total_skipped += 1
+                        pbar_outer.update(1)
+                        continue
+                else:
                 if cache_file.exists() and thin_file.exists() and not args.overwrite:
                     print(f"   ⏭️  {label}: Cache exists, skipping (use --overwrite to recompute)")
+                        total_skipped += 1
+                        pbar_outer.update(1)
+                        continue
                     total_skipped += 1
                     pbar_outer.update(1)
                     continue
@@ -236,6 +290,10 @@ def main():
                 except Exception as e:
                     print(f"   ⚠️  {label}: Failed to save thinned projection cache: {e}")
 
+                if bool(args.thin_only):
+                    total_computed += 1
+                    print(f"   ✅ {label}: thin saved ({thin_file.name})")
+                else:
                 print(f"   🧹 {label}: BM3D denoising (parallel: {num_workers} workers)...")
                 proj_bm3d = bm3d_denoise_projection(proj_low, sigma_psd=args.sigma_psd, num_workers=num_workers)
 

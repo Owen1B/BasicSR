@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 from spect_ct.pipeline.inference import (
     denoise_views,
     load_basicsr_net,
+    proj_total_counts_clip,
     proj_total_counts_round_clip,
     recon_total_counts_clip,
 )
@@ -18,7 +19,6 @@ from spect_ct.pipeline.io import (
     load_projection_i16,
     load_recon_f32,
     save_projection_f32,
-    save_projection_i16_round_clip,
 )
 from spect_ct.pipeline.osem import run_osem_reconstruction
 from spect_ct.pipeline.poisson import poisson_sample
@@ -52,10 +52,10 @@ def generate_gif_counts_from_existing(
     - 已经有投影（original/denoised/denoised_poisson）以及重建（original/denoised/denoised_poisson）
     - 不想再跑推理/重建，只想补生成 GIF/统计
 
-    Required files under patient_dir:
-      projections/original_projection.dat
-      projections/denoised_projection.dat  (or denoised_projection_f32.dat preferred for fp32 display/metrics)
-      projections/denoised_poisson_projection.dat
+    Required files under patient_dir (fp32-only layout):
+      projections/original_projection_f32.dat
+      projections/denoised_projection_f32.dat
+      projections/denoised_poisson_projection_f32.dat
       reconstructions/<patient>_{original,denoised,denoised_poisson}_OSEMReconed_Iter{iterations}.dat
     """
     patient = str(patient)
@@ -76,18 +76,17 @@ def generate_gif_counts_from_existing(
             return gif_path, counts_txt
 
     # ---- projections ----
-    orig_proj_file = proj_dir / "original_projection.dat"
-    den_i16_file = proj_dir / "denoised_projection.dat"
+    orig_proj_file = proj_dir / "original_projection_f32.dat"
     den_f32_file = proj_dir / "denoised_projection_f32.dat"
-    den_p_file = proj_dir / "denoised_poisson_projection.dat"
-    missing_proj = [str(p) for p in [orig_proj_file, den_i16_file, den_p_file] if not p.exists()]
+    den_p_file = proj_dir / "denoised_poisson_projection_f32.dat"
+    missing_proj = [str(p) for p in [orig_proj_file, den_f32_file, den_p_file] if not p.exists()]
     if missing_proj:
         raise FileNotFoundError(f"[{patient}] missing projections: {missing_proj}")
 
-    orig_proj = load_projection_i16(orig_proj_file)
-    denoised_u16_proj = load_projection_i16(den_i16_file)
-    denoised_fp32_proj = load_projection_f32(den_f32_file) if den_f32_file.exists() else denoised_u16_proj
-    denoised_poisson_proj = load_projection_i16(den_p_file)
+    orig_proj = load_projection_f32(orig_proj_file)
+    denoised_fp32_proj = load_projection_f32(den_f32_file)
+    denoised_u16_proj = denoised_fp32_proj  # placeholder for legacy layout; no int16 anymore
+    denoised_poisson_proj = load_projection_f32(den_p_file)
 
     # ---- reconstructions ----
     it = int(iterations)
@@ -113,7 +112,9 @@ def generate_gif_counts_from_existing(
     proj_counts = {
         "original": proj_total_counts_round_clip(orig_proj),
         "denoised_u16": proj_total_counts_round_clip(denoised_u16_proj),
-        "denoised_fp32": proj_total_counts_round_clip(denoised_fp32_proj),
+        # fp32 projection is lambda-like; use float sum (no rounding) to match validation display.
+        "denoised_fp32": proj_total_counts_clip(denoised_fp32_proj),
+        "denoised_fp32_round": proj_total_counts_round_clip(denoised_fp32_proj),
         "denoised_poisson": proj_total_counts_round_clip(denoised_poisson_proj),
     }
     recon_counts = {
@@ -131,7 +132,8 @@ def generate_gif_counts_from_existing(
         "[projection_domain_total_counts]  (sum over views/pixels, using round()+clip>=0)",
         f"original: {proj_counts['original']:.0f}",
         f"denoised_u16: {proj_counts['denoised_u16']:.0f}  ({_safe_pct(proj_counts['denoised_u16'], proj_counts['original']):+.4f}%)",
-        f"denoised_fp32: {proj_counts['denoised_fp32']:.0f}  ({_safe_pct(proj_counts['denoised_fp32'], proj_counts['original']):+.4f}%)",
+        f"denoised_fp32: {proj_counts['denoised_fp32']:.3f}  ({_safe_pct(proj_counts['denoised_fp32'], proj_counts['original']):+.4f}%)",
+        f"denoised_fp32_round: {proj_counts['denoised_fp32_round']:.0f}  ({_safe_pct(proj_counts['denoised_fp32_round'], proj_counts['original']):+.4f}%)",
         f"denoised_poisson: {proj_counts['denoised_poisson']:.0f}  ({_safe_pct(proj_counts['denoised_poisson'], proj_counts['original']):+.4f}%)",
         "",
         "[reconstruction_domain_total_counts]  (sum over voxels, clip>=0)",
@@ -212,7 +214,7 @@ def generate_1x3_proj_gif(
     vmax = float(np.max(orig_proj))  # display scaling follows BasicSR: per-sample max from ORIGINAL
     # Precompute counts (aligned with counts.txt: round()+clip>=0).
     tot_o = float(proj_total_counts_round_clip(orig_proj))
-    tot_d = float(proj_total_counts_round_clip(denoised_proj))
+    tot_d = float(proj_total_counts_clip(denoised_proj))
     tot_q = float(proj_total_counts_round_clip(denoised_proj_q)) if denoised_proj_q is not None else float("nan")
     tot_p = float(proj_total_counts_round_clip(denoised_poisson_proj))
 
@@ -564,7 +566,7 @@ def generate_2x4_gif(
         # row1: projection metrics vs original projection
         tot_po = proj_total_counts_round_clip(orig_proj)
         tot_pu = proj_total_counts_round_clip(denoised_u16_proj)
-        tot_pf = proj_total_counts_round_clip(denoised_fp32_proj)
+        tot_pf = proj_total_counts_clip(denoised_fp32_proj)
         tot_pp = proj_total_counts_round_clip(denoised_poisson_proj)
         def _pct(new: float, base: float) -> float:
             if abs(base) < 1e-12:
@@ -792,13 +794,12 @@ def process_patient_3proj3recon(
     if stage not in ["all", "denoise", "recon_only", "gif_counts"]:
         raise ValueError(f"Unsupported stage: {stage}. Use all|denoise|recon_only|gif_counts")
 
-    # 1) load original projection
+    # 1) load original projection (dataset is int16) but store as fp32 only.
     orig_proj = load_projection_i16(input_proj)
-    orig_proj_file = proj_dir / "original_projection.dat"
-    save_projection_i16_round_clip(orig_proj_file, orig_proj)
+    orig_proj_file = proj_dir / "original_projection_f32.dat"
+    save_projection_f32(orig_proj_file, orig_proj)
 
     # 2) denoise
-    denoised_proj_file = proj_dir / "denoised_projection.dat"
     denoised_proj_f32_file = proj_dir / "denoised_projection_f32.dat"
     if not skip_denoise:
         print(f"[INFO][{patient}] loading net: ckpt={Path(checkpoint)} config={Path(config)}")
@@ -806,59 +807,63 @@ def process_patient_3proj3recon(
         loaded = load_basicsr_net(config, checkpoint, device=device, require_ema=True)
         print(f"[INFO][{patient}] loaded weights key={loaded.used_key} (params_ema is aligned with training EMA)")
         denoised_proj = denoise_views(loaded.net, orig_proj, max_value=float(max_value), device=device)
-        save_projection_i16_round_clip(denoised_proj_file, denoised_proj)
         save_projection_f32(denoised_proj_f32_file, denoised_proj)
     else:
         if denoised_proj_f32_file.exists():
             print(f"[INFO][{patient}] skip_denoise=true, reuse(fp32): {denoised_proj_f32_file}")
             denoised_proj = load_projection_f32(denoised_proj_f32_file)
         else:
-            print(f"[INFO][{patient}] skip_denoise=true, reuse(uint16): {denoised_proj_file}")
-            denoised_proj = load_projection_i16(denoised_proj_file)
+            # Backward-compat: older runs may have int16 file only.
+            denoised_proj_file_legacy = proj_dir / "denoised_projection.dat"
+            print(f"[INFO][{patient}] skip_denoise=true, reuse(legacy int16): {denoised_proj_file_legacy}")
+            denoised_proj = load_projection_i16(denoised_proj_file_legacy)
+            save_projection_f32(denoised_proj_f32_file, denoised_proj)
 
     # 3) poisson sample
     denoised_poisson_proj = poisson_sample(denoised_proj)
-    denoised_poisson_proj_file = proj_dir / "denoised_poisson_projection.dat"
-    save_projection_i16_round_clip(denoised_poisson_proj_file, denoised_poisson_proj)
+    denoised_poisson_proj_file = proj_dir / "denoised_poisson_projection_f32.dat"
+    save_projection_f32(denoised_poisson_proj_file, denoised_poisson_proj)
 
     # Stage gate: allow preparing projections first, then run recon+gif in parallel.
     if stage == "denoise":
         # Also generate a projection-only GIF (similar naming/layout to BasicSR experiments GIFs).
-        try:
-            exp_name = Path(config).stem
-            ckpt_path = Path(checkpoint)
-            # Parse iter from checkpoint name like net_g_98500.pth.
-            # If checkpoint is net_g_latest.pth (no iter in name), infer from sibling net_g_*.pth.
-            import re
-            m = re.search(r"net_g[_-](\d+)\.pth", str(ckpt_path.name))
-            it = int(m.group(1)) if m else None
-            if it is None and ckpt_path.parent.is_dir():
-                best = 0
-                for p in ckpt_path.parent.glob("net_g_*.pth"):
-                    mm = re.search(r"net_g_(\d+)\.pth", p.name)
-                    if mm:
-                        best = max(best, int(mm.group(1)))
-                it = best
-            if it is None:
-                it = 0
-            # We only support EMA model for this pipeline.
-            net_tag = "ema"
-            # Put projection-only GIF under the same per-patient gif_dir.
-            gif_path = gif_dir / f"{exp_name}_iter{it}_{net_tag}.gif"
-            den_q = load_projection_i16(denoised_proj_file)
-            generate_1x3_proj_gif(
-                orig_proj=orig_proj,
-                denoised_proj=denoised_proj,
-                denoised_proj_q=den_q,
-                denoised_poisson_proj=denoised_poisson_proj,
-                output_path=gif_path,
-                use_log1p=bool(use_log1p),
-                fps=10.0,
-                metric_max_value=float(max_value),
-            )
-        except Exception:
-            # Don't fail denoise stage due to visualization issues.
-            pass
+        # IMPORTANT: respect `gif` flag (toolbox --no-gif), and default to 1x3 to avoid confusion
+        # from low-dose fp32->int16 rounding drift in the optional quantized column.
+        if bool(gif):
+            try:
+                exp_name = Path(config).stem
+                ckpt_path = Path(checkpoint)
+                # Parse iter from checkpoint name like net_g_98500.pth.
+                # If checkpoint is net_g_latest.pth (no iter in name), infer from sibling net_g_*.pth.
+                import re
+                m = re.search(r"net_g[_-](\d+)\.pth", str(ckpt_path.name))
+                it = int(m.group(1)) if m else None
+                if it is None and ckpt_path.parent.is_dir():
+                    best = 0
+                    for p in ckpt_path.parent.glob("net_g_*.pth"):
+                        mm = re.search(r"net_g_(\d+)\.pth", p.name)
+                        if mm:
+                            best = max(best, int(mm.group(1)))
+                    it = best
+                if it is None:
+                    it = 0
+                # We only support EMA model for this pipeline.
+                net_tag = "ema"
+                # Put projection-only GIF under the same per-patient gif_dir.
+                gif_path = gif_dir / f"{exp_name}_iter{it}_{net_tag}.gif"
+                generate_1x3_proj_gif(
+                    orig_proj=orig_proj,
+                    denoised_proj=denoised_proj,
+                    denoised_proj_q=None,
+                    denoised_poisson_proj=denoised_poisson_proj,
+                    output_path=gif_path,
+                    use_log1p=bool(use_log1p),
+                    fps=10.0,
+                    metric_max_value=float(max_value),
+                )
+            except Exception:
+                # Don't fail denoise stage due to visualization issues.
+                pass
         return Patient3Proj3ReconOutputs(
             patient=patient,
             output_dir=output_dir,
@@ -871,22 +876,23 @@ def process_patient_3proj3recon(
     # In gif_counts stage, we should not require GPU.
     # Ensure projections & recon outputs exist (they should if stage='recon_only' ran previously).
     if stage == "gif_counts":
-        orig_proj = load_projection_i16(orig_proj_file)
-        denoised_u16_proj = load_projection_i16(denoised_proj_file)
-        denoised_fp32_proj = load_projection_f32(denoised_proj_f32_file) if denoised_proj_f32_file.exists() else denoised_u16_proj
-        denoised_poisson_proj = load_projection_i16(denoised_poisson_proj_file)
+        # fp32-only layout (backward compat: fall back to legacy int16 if needed)
+        orig_proj = load_projection_f32(orig_proj_file) if orig_proj_file.name.endswith("_f32.dat") else load_projection_i16(orig_proj_file)
+        denoised_fp32_proj = load_projection_f32(denoised_proj_f32_file)
+        denoised_u16_proj = denoised_fp32_proj  # placeholder to satisfy downstream signatures; not used for saving.
+        denoised_poisson_proj = load_projection_f32(denoised_poisson_proj_file) if denoised_poisson_proj_file.exists() else denoised_poisson_proj
     else:
         # For all other stages, we already have denoised_proj in memory (fp32 if computed).
         denoised_fp32_proj = denoised_proj
-        denoised_u16_proj = load_projection_i16(denoised_proj_file)
+        denoised_u16_proj = denoised_fp32_proj  # no int16 path anymore
 
     # 4) reconstructions
     recon_paths: dict[str, Path] = {}
+    # fp32-only projection files for recon (PrjDataType=1).
     recon_jobs: list[tuple[Path, str, int]] = [
-        (orig_proj_file, "original", 2),  # int16 projections
-        (denoised_proj_file, "denoised", 2),  # denoised uint16 projections
-        (denoised_proj_f32_file if denoised_proj_f32_file.exists() else denoised_proj_file, "denoised_fp32", 1),  # fp32 projections
-        (denoised_poisson_proj_file, "denoised_poisson", 2),  # poisson projections are integer
+        (orig_proj_file, "original", 1),
+        (denoised_proj_f32_file, "denoised_fp32", 1),
+        (denoised_poisson_proj_file, "denoised_poisson", 1),
     ]
     for proj_file, recon_name, prj_dtype in recon_jobs:
         # Original recon may come from a dataset-side cache (ensure_original_recon).
@@ -949,7 +955,9 @@ def process_patient_3proj3recon(
     proj_counts = {
         "original": proj_total_counts_round_clip(orig_proj),
         "denoised_u16": proj_total_counts_round_clip(denoised_u16_proj),
-        "denoised_fp32": proj_total_counts_round_clip(denoised_fp32_proj),
+        # fp32 projection is lambda-like; use float sum (no rounding) to match validation display.
+        "denoised_fp32": proj_total_counts_clip(denoised_fp32_proj),
+        "denoised_fp32_round": proj_total_counts_round_clip(denoised_fp32_proj),
         "denoised_poisson": proj_total_counts_round_clip(denoised_poisson_proj),
     }
     recon_counts = {
@@ -969,7 +977,8 @@ def process_patient_3proj3recon(
         "[projection_domain_total_counts]  (sum over views/pixels, using round()+clip>=0)",
         f"original: {proj_counts['original']:.0f}",
         f"denoised_u16: {proj_counts['denoised_u16']:.0f}  ({_safe_pct(proj_counts['denoised_u16'], proj_counts['original']):+.4f}%)",
-        f"denoised_fp32: {proj_counts['denoised_fp32']:.0f}  ({_safe_pct(proj_counts['denoised_fp32'], proj_counts['original']):+.4f}%)",
+        f"denoised_fp32: {proj_counts['denoised_fp32']:.3f}  ({_safe_pct(proj_counts['denoised_fp32'], proj_counts['original']):+.4f}%)",
+        f"denoised_fp32_round: {proj_counts['denoised_fp32_round']:.0f}  ({_safe_pct(proj_counts['denoised_fp32_round'], proj_counts['original']):+.4f}%)",
         f"denoised_poisson: {proj_counts['denoised_poisson']:.0f}  ({_safe_pct(proj_counts['denoised_poisson'], proj_counts['original']):+.4f}%)",
         "",
         "[reconstruction_domain_total_counts]  (sum over voxels, clip>=0)",

@@ -78,7 +78,6 @@ def denoise_views(
     proj_count: np.ndarray,
     max_value: float,
     device: str = "cuda",
-    *,
 ) -> np.ndarray:
     """推理入口：支持 2D(逐视角) 和 3D(整块 60-view volume) 两种网络。
 
@@ -115,6 +114,12 @@ def denoise_views(
 def proj_total_counts_round_clip(proj: np.ndarray) -> float:
     x = np.round(proj.astype(np.float64, copy=False))
     x = np.clip(x, 0.0, None)
+    return float(np.sum(x))
+
+
+def proj_total_counts_clip(proj: np.ndarray) -> float:
+    """Total counts for lambda-like fp32 projections (no rounding; clip>=0)."""
+    x = np.clip(proj.astype(np.float64, copy=False), 0.0, None)
     return float(np.sum(x))
 
 
