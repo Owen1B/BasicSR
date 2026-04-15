@@ -1,0 +1,195 @@
+# Mixed-dose N2N + weak regularization (teacher-student under Poisson corruption)
+#
+# Base: multidose N2N (k in {2,3,4,5}) with same-dose two-split thinning.
+# Weak constraint: SPECT3DConsistencyModel.lowdose_opt
+#   - Teacher = EMA(x)
+#   - Create synthetic lower-dose observation by scaling teacher rate and Poisson sampling
+#   - Student denoises that and matches the scaled teacher rate (in count domain)
+#
+# This pushes low-dose behavior to be consistent with the "most trusted" teacher output.
+
+name: n2n_spect229_60view3d_unet_projonly_full_multidose_weakcons
+model_type: SPECT3DConsistencyModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+auto_resume: true
+
+datasets:
+  train:
+    name: spect229_train_60view_full
+    type: SPECT60ViewVolumeDataset
+    phase: train
+    mode: n2n
+    dataroot_gt: datasets/SPECT229
+    pattern_gt: "**/*_Proj4Filter.dat"
+    views: 60
+    height: 128
+    width: 128
+    dtype: uint16
+    max_value: 150.0
+    gt_scale_factor: 1.0
+    clip_max_value: false
+
+    # Mixed-dose: sample k each item, generate two SAME-dose splits (both 20s/k)
+    n2n_split_mode: same_dose
+    n2n_k_choices: [2, 3, 4, 5]
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    start_idx: 4
+    end_idx: 229
+
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 4
+    pin_memory: true
+    persistent_workers: true
+
+  val:
+    name: SPECT229_val_projection
+    type: SPECTProjectionEvalDataset
+    dataroot: datasets/SPECT229
+    pattern: "**/*_Proj4Filter.dat"
+    height: 128
+    width: 128
+    views: 60
+    start_idx: 0
+    end_idx: 4
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+network_g:
+  type: UNet3DRes
+  in_nc: 1
+  out_nc: 1
+  nc: [16, 32, 64, 128]
+  nb: 2
+  bias: false
+  global_residual: true
+  circular_depth: true
+  act: relu
+
+path:
+  # Warm-start from the best EMA checkpoint of the baseline 20s N2N run.
+  # We load params_ema into net_g (param_key_g) so fine-tuning starts from your most trusted weights.
+  pretrain_network_g: experiments/n2n_spect229_60view3d_unet_projonly_full/models/net_g_best.pth
+  param_key_g: params_ema
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  pbar: true
+  disable_cudnn: false
+  amp:
+    enable: false
+    dtype: bf16
+    loss_fp32: true
+    use_scaler: false
+  ema_decay: 0.999
+  accumulation_steps: 1
+  optim_g:
+    type: AdamW
+    # Fine-tune on mixed-dose distribution: use a smaller LR than baseline.
+    lr: !!float 5e-5
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [500000]
+    restart_weights: [1]
+    eta_min: !!float 1e-5
+
+  total_iter: 500000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-09
+    max_value: 150.0
+    norm_type: linear
+
+  # Weak constraint: low-dose Poisson consistency on teacher (EMA) rate
+  # Note: this adds an extra forward pass of net_g per iter.
+  consistency_opt:
+    loss_weight: 0.0   # keep off by default; enable if you want cycle-consistency too
+    start_iter: 0
+    target: g_on_input
+    use_ema_teacher: true
+    detach_target: true
+    domain: count
+    loss_type: poisson
+    max_value: 150.0
+    norm_type: linear
+
+  lowdose_opt:
+    loss_weight: 0.05
+    start_iter: 0
+    use_ema_teacher: true
+    detach_target: true
+    domain: count
+    loss_type: poisson
+    # factor s means: A = teacher/s, so s=2..5 roughly matches 10s..4s
+    factor_min: 2.0
+    factor_max: 5.0
+    per_sample: true
+    max_value: 150.0
+    norm_type: linear
+
+val:
+  val_freq: 1000
+  save_img: false
+  # Visualization: prefer MP4 (truecolor) over legacy GIF
+  generate_gif: false
+  generate_mp4_thin_factors: true
+  mp4_output_dir: experiments/{name}/visualization/mp4s
+  mp4_thin_factors: [2, 3, 4, 5]
+  mp4_thin_seed: 123
+  mp4_fps: 10
+  mp4_crf: 18
+  mp4_log1p: true
+  # Note: this also limits MP4 count in SPECT3DModel validation.
+  max_gifs_per_val: 4
+  save_best_ckpt: true
+  best_metric: lpips_poisson_mean_alex_ema
+  eval_networks: [ema]
+  poisson_calibration_opt:
+    enable: true
+    bin_width: 1.0
+    max_bin: 50.0
+    min_count: 10000
+    out_dir: experiments/{name}/analysis/poisson_calibration_iter{iter}
+  compute_lpips_poisson_vs_original: true
+  lpips_nets: [alex, vgg]
+  lpips_poisson_repeats_alex: 100
+  lpips_poisson_repeats_vgg: 10
+  lpips_view_stride: 1
+  lpips_max_value: 150.0
+  lpips_poisson_batch: 4
+  lpips_poisson_view_chunk: 10
+  metrics:
+    lpips_poisson_mean_alex:
+      type: lpips_poisson_mean
+      better: lower
+      lpips_net: alex
+      repeats: 100
+      max_value: 150.0
+    pll_mean:
+      type: pll
+      better: lower
+      full: true
+      eps: 1.0e-08
+  persist_best_metrics: true
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 1000
+  keep_ckpt_num: 15
+  keep_state_num: 2
+  use_tb_logger: true
+  wandb: null
+
+

@@ -1,0 +1,149 @@
+# NEMA Single Projection Fine-tuning
+# Fine-tune the SPECT229 trained model on a single NEMA projection
+# Uses mixed-dose N2N strategy with in-batch diversity
+
+name: finetune_nema_single_projection
+model_type: SRModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: NEMA_single_train
+    type: NEMASingleProjectionPatchDataset  # Use patch mode to save GPU memory
+    projection_file: datasets/NEMA/osem/ProjectionImage_Original.dat
+    views: 120
+    height: 256
+    width: 256
+    dtype: uint16
+    max_value: 150.0
+    
+    # Mixed-dose N2N parameters (in-batch diversity)
+    n2n_k_choices: [2, 3, 4, 5]
+    
+    # Virtual dataset size (repeats per epoch)
+    virtual_dataset_size: 500
+    
+    # Patch extraction (to fit in GPU memory)
+    # Option 1: Small patches (more diversity, less context)
+    patch_size_v: 60
+    patch_size_h: 128
+    patch_size_w: 128
+    
+    # Option 2: Full volume (if GPU memory allows, comment out patch params and use NEMASingleProjectionDataset)
+    # type: NEMASingleProjectionDataset
+    
+    # Augmentation (light, preserve SPECT structure)
+    use_flip: true
+    use_rot: false  # Rotation might break anatomical orientation
+    
+    # DataLoader
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 2
+    pin_memory: true
+    persistent_workers: true
+
+  val:
+    name: NEMA_single_val
+    type: NEMASingleProjectionDataset
+    projection_file: datasets/NEMA/osem/ProjectionImage_Original.dat
+    views: 120
+    height: 256
+    width: 256
+    dtype: uint16
+    max_value: 150.0
+    n2n_k_choices: [2]  # Fixed k=2 for validation consistency
+    virtual_dataset_size: 10
+    use_flip: false
+    use_rot: false
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+# Network (same as pre-trained model)
+network_g:
+  type: UNet3DRes
+  in_nc: 1
+  out_nc: 1
+  nc: [32, 64, 128, 256]
+  nb: 4
+  bias: false
+  global_residual: true
+  circular_depth: true
+  act: relu
+
+# Path to pre-trained model
+path:
+  pretrain_network_g: experiments/pretrained_models/n2n_spect229_net_g_91000.pth
+  param_key_g: params_ema
+  strict_load_g: false  # Allow size mismatch if needed
+  resume_state: ~
+
+# Training
+train:
+  pbar: true
+  disable_cudnn: false
+  amp:
+    enable: false  # Disable for stability in fine-tuning
+  ema_decay: 0.999
+  accumulation_steps: 4  # Effective batch = 2 × 4 = 8
+  
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-6  # Very small LR for fine-tuning on single sample
+    weight_decay: !!float 1e-5  # Smaller weight decay to avoid destroying pre-trained features
+    betas: [0.9, 0.999]
+  
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [10000]  # Short fine-tuning period
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+  
+  total_iter: 10000
+  warmup_iter: 100
+  
+  # Loss function (same as pre-training)
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-9
+    max_value: 150.0
+    norm_type: linear
+
+# Validation
+val:
+  val_freq: 500
+  save_img: false
+  max_num_images: 10
+  
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+# Logging
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 500
+  keep_ckpt_num: 5
+  keep_state_num: 2
+  use_tb_logger: true
+  wandb:
+    project: nema_finetune
+    resume_id: ~
+
+
+
+
+
+
+
+

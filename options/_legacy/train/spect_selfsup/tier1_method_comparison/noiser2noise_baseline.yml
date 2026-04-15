@@ -1,0 +1,188 @@
+# ============================================================================
+# Tier 1: Noiser2Noise Baseline - ⚠️ EXCLUDED FROM EXPERIMENTS
+# ============================================================================
+# ⚠️ WARNING: This method has fundamental theoretical issues and is NOT used
+#
+# 问题: 从 1x (已有噪声) 再采样生成 y 会产生复合泊松分布
+#       y ~ Poisson(1x) where 1x ~ Poisson(λ_clean)
+#       => y ~ Compound Poisson, NOT simple Poisson
+#
+# 后果: PoissonNLLLoss 无法处理复合分布
+#       Loss 会爆炸到 -1e10 (应该是 -2 到 -5)
+#       最终 PSNR ~36 dB (等同于噪声水平，完全失败)
+#
+# 结论: 此配置仅保留作为负面案例，不参与实际实验
+# ============================================================================
+# 方法: Noiser2Noise - 从1x泊松采样生成更噪版本，1x作为label
+# 配置: Linear归一化 + PoissonNLL损失（理论匹配）
+# 原理: y ~ Poisson(λ=1x), 网络学习 E[1x|y]
+# 优势: (1) 只需1x图像 (2) 不需要split (3) 理论上可用PoissonNLL
+# 预期: 可能略低于N2N（因为1x本身有噪声），但应该接近N2V/N2B
+# ============================================================================
+
+name: noiser2noise_baseline
+
+model_type: SRModel
+scale: 1
+
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: XCAT_train_noiser2noise
+    type: Noiser2NoiseDataset
+    mode: paired
+    dataroot_gt: datasets/spectH_XCAT_poisson_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+
+    view_mode: stack2
+    start_idx: 0
+    end_idx: 96
+
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+    gt_size: 64        # Small patch for diversity
+    use_hflip: false
+    use_rot: false
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 16
+    dataset_enlarge_ratio: 1
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: ~
+
+  val:
+    name: XCAT_val_paired
+    type: SPECTDatPairedDataset
+    mode: paired
+    dataroot_lq: datasets/spectH_XCAT_poisson_1x
+    dataroot_gt: datasets/spectH_XCAT_ideal_1x
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_mode: stack2
+    start_idx: 96
+    end_idx: 100
+
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    norm:
+      type: linear
+
+network_g:
+  type: UNetRes
+  in_nc: 2
+  out_nc: 2
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~  # Will be auto-set by resume script
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4  # Critical for preventing overfitting
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [50000]
+    restart_weights: [1]
+    eta_min: !!float 1e-5
+
+  total_iter: 50000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss  # Optimal for Poisson noise
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-9
+    max_value: 150.0
+    norm_type: linear
+
+val:
+  val_freq: 1000
+  save_img: false
+
+  eval_networks: [g, ema]
+  save_img_networks: [ema]
+  pbar: false
+  suffix: ~
+  metric_domain: count
+
+  save_best_ckpt: true
+  best_metric: psnr_cnt_ema
+
+  spect_vis:
+    enable: true
+    vmax_cnt: 150.0
+    vlim_res: 30.0
+    vlim_anscombe: 1.0
+
+  metrics:
+    psnr_cnt:
+      type: calculate_psnr_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    ssim_cnt:
+      type: calculate_ssim_range
+      domain: count
+      data_range: 150.0
+      crop_border: 0
+      test_y_channel: false
+      better: higher
+
+    lpips:
+      type: calculate_lpips
+      domain: count
+      better: lower
+      lpips_net: vgg
+      lpips_local_repeat_n: 10
+
+    poisson_fit:
+      type: calculate_poisson_fit
+      domain: count
+      bin_center: nearest_int
+      bin_size: 1.0
+      min_pixels_per_bin: 512
+      min_gt: 0.5
+      better: lower
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  use_tb_logger: true
+  print_eta: false
+  keep_ckpt_num: 2      # Only keep 2 checkpoints to save space
+  keep_state_num: 2     # Only keep 2 state files
+  wandb:
+    project: spect_selfsup_denoising
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

@@ -1,0 +1,135 @@
+# NEMA Single Projection Fine-tuning (Full Volume)
+# Use this config if you have enough GPU memory (>24GB recommended)
+# Trains on full 120×256×256 volumes
+
+name: finetune_nema_single_projection_fullvolume
+model_type: SRModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  train:
+    name: NEMA_single_train_full
+    type: NEMASingleProjectionDataset  # Full volume, no patching
+    projection_file: datasets/NEMA/osem/ProjectionImage_Original.dat
+    views: 120
+    height: 256
+    width: 256
+    dtype: uint16
+    max_value: 150.0
+    
+    # Mixed-dose N2N parameters (in-batch diversity)
+    n2n_k_choices: [2, 3, 4, 5]
+    
+    # Virtual dataset size (repeats per epoch)
+    virtual_dataset_size: 200  # Smaller since each item is full volume
+    
+    # Augmentation
+    use_flip: true
+    use_rot: false
+    
+    # DataLoader
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 1  # Must be 1 for full volume
+    pin_memory: true
+    persistent_workers: true
+
+  val:
+    name: NEMA_single_val_full
+    type: NEMASingleProjectionDataset
+    projection_file: datasets/NEMA/osem/ProjectionImage_Original.dat
+    views: 120
+    height: 256
+    width: 256
+    dtype: uint16
+    max_value: 150.0
+    n2n_k_choices: [2]
+    virtual_dataset_size: 5
+    use_flip: false
+    use_rot: false
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+# Network (same as pre-trained model)
+network_g:
+  type: UNet3DRes
+  in_nc: 1
+  out_nc: 1
+  nc: [32, 64, 128, 256]
+  nb: 4
+  bias: false
+  global_residual: true
+  circular_depth: true
+  act: relu
+
+# Path to pre-trained model
+path:
+  pretrain_network_g: experiments/pretrained_models/n2n_spect229_net_g_91000.pth
+  param_key_g: params_ema
+  strict_load_g: false
+  resume_state: ~
+
+# Training
+train:
+  pbar: true
+  disable_cudnn: false
+  amp:
+    enable: false
+  ema_decay: 0.999
+  accumulation_steps: 8  # Effective batch = 1 × 8 = 8
+  
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-7  # Even smaller LR for full volume
+    weight_decay: !!float 1e-5
+    betas: [0.9, 0.999]
+  
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [5000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+  
+  total_iter: 5000
+  warmup_iter: 100
+  
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-9
+    max_value: 150.0
+    norm_type: linear
+
+# Validation
+val:
+  val_freq: 250
+  save_img: true
+  max_num_images: 5
+  
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+
+# Logging
+logger:
+  print_freq: 25
+  save_checkpoint_freq: 250
+  keep_ckpt_num: 5
+  keep_state_num: 2
+  use_tb_logger: true
+  wandb:
+    project: nema_finetune
+    resume_id: ~
+
+
+
+
+
+
+
+

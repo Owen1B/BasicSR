@@ -1,0 +1,81 @@
+name: debug_m6_planar_2d_1view
+model_type: SPECTModel
+scale: 1
+num_gpu: 0
+manual_seed: 42
+
+datasets:
+  train:
+    name: debug_m6_planar_2d_1view_train
+    type: SPECTTrainDataset
+    phase: train
+    mode: poisson_thinning
+    input_layout: ap2
+    dataroot_gt: /home/owen/code/BasicSR/datasets/spectH_XCAT_poisson_1x
+    pattern_gt: "*.dat"
+    views: 2
+    dtype: float32
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_sampler:
+      mode: single_view
+      view_indices: [0, 1]
+    pack_mode: 2d_channel
+    max_value: 150.0
+    gt_scale_factor: 1.0
+    poisson_thinning_prob: 0.5
+    poisson_thinning_random_swap: false
+    poisson_thinning_round_mode: nearest
+    gt_size: 64
+    start_idx: 0
+    end_idx: 2
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: false
+
+network_g:
+  type: UNetRes
+  in_nc: 1
+  out_nc: 1
+  nc: [8, 16, 32, 64]
+  nb: 1
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: false
+  optim_g:
+    type: Adam
+    lr: 1.0e-4
+    weight_decay: 0
+    betas: [0.9, 0.999]
+  scheduler:
+    type: MultiStepLR
+    milestones: [2]
+    gamma: 1
+  total_iter: 2
+  warmup_iter: -1
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+logger:
+  print_freq: 1
+  save_checkpoint_freq: 1
+  use_tb_logger: false
+  wandb: null
+
+dist_params:
+  backend: nccl
+  port: 29500

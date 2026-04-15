@@ -1,0 +1,96 @@
+name: debug_planar_2d_2view_multidose_N_clinical_fullimg_b2acc2
+model_type: SPECTModel
+scale: 1
+num_gpu: 1
+manual_seed: 42
+auto_resume: false
+
+datasets:
+  train:
+    name: debug_clinical198_planar_2d_2view_multidose_N_fullimg_b2acc2
+    type: SPECTTrainDataset
+    phase: train
+    mode: poisson_thinning
+    input_layout: ap2
+    dataroot_gt: datasets/spectH_clinical_new
+    pattern_gt: "*.dat"
+    views: 2
+    dtype: float32
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_sampler:
+      mode: opposite_pair
+      offset: 1
+    pack_mode: 2d_channel
+    start_idx: 0
+    end_idx: 8
+    use_hflip: false
+    use_rot: false
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    clip_max_value: false
+    norm:
+      type: linear
+    poisson_thinning_mode: same_dose
+    poisson_thinning_k_choices: [2, 3, 4, 5]
+    poisson_thinning_prob: 0.5
+    poisson_thinning_random_swap: false
+    poisson_thinning_round_mode: nearest
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 1
+    pin_memory: false
+
+network_g:
+  type: UNetRes
+  in_nc: 2
+  out_nc: 2
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+  accumulation_steps: 2
+  optim_g:
+    type: AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    type: MultiStepLR
+    milestones: [10]
+    gamma: 1
+  total_iter: 2
+  warmup_iter: -1
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-9
+    max_value: 150.0
+    norm_type: linear
+
+logger:
+  print_freq: 1
+  save_checkpoint_freq: 2
+  keep_ckpt_num: 1
+  keep_state_num: 1
+  use_tb_logger: false
+  wandb: null
+
+
+dist_params:
+  backend: nccl
+  port: 29500

@@ -1,0 +1,148 @@
+# SPECT229 single-view N2N config with patch64
+# Dataset: SPECT229_projection_paired (229 patients × 30 pairs = 6,870 files)
+# Reference: bone_real/n2n_bone_proj_20s_singleview_sota.yml
+#
+# Key settings:
+# - AdamW lr=1e-4, wd=1e-4, betas=(0.9,0.999)
+# - CosineAnnealingRestartLR, eta_min=1e-5, total_iter=1M
+# - patch(gt_size)=64, batch=32, enlarge_ratio=4
+# - Linear norm + PoissonNLLLoss (count-domain), n2n_p=0.5
+# - Single-channel: view_mode=split1 + UNetRes(in_nc=1,out_nc=1)
+
+name: n2n_spect229_singleview_patch64
+model_type: SPECT3DModel  # Use SPECT3DModel for automatic GIF generation during validation
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+auto_resume: true  # Automatically resume from latest checkpoint if exists
+
+datasets:
+  train:
+    name: SPECT229_train_n2n_single
+    type: SPECTDatPairedDataset
+    mode: n2n
+    dataroot_gt: datasets/SPECT229_projection_paired
+    height: 128
+    width: 128
+
+    # single-view samples (H,W,1)
+    view_mode: split1
+    view_select: both
+    posterior_flip: false
+
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    # SPECT229 data range: [0, 1009], mean: 2.27
+    # Use max_value=150.0 for normalization (consistent with XCAT experiments)
+    max_value: 150.0
+    clip_max_value: false
+    norm:
+      type: linear
+
+    # SOTA-like patch/batch (patch64 for better diversity)
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    # Use all 6,870 files for training (self-supervised, no validation split needed)
+    start_idx: 0
+    end_idx: 6870
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 32
+    dataset_enlarge_ratio: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: null
+
+  # Validation dataset (required for GIF generation)
+  val:
+    name: SPECT229_val_projection
+    type: SPECTProjectionEvalDataset
+    dataroot: datasets/SPECT229
+    pattern: "**/*_Proj4Filter.dat"
+    height: 128
+    width: 128
+    views: 60
+    start_idx: 0
+    end_idx: 3
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+
+network_g:
+  type: UNetRes
+  in_nc: 1
+  out_nc: 1
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: 0.0001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [1000000]
+    restart_weights: [1]
+    eta_min: 1.0e-05
+
+  total_iter: 1000000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-09
+    max_value: 150.0
+    norm_type: linear
+
+# Validation settings
+val:
+  val_freq: 10000  # Validate every 10k iterations
+  save_img: false  # Don't save individual images, only GIFs
+
+  # Enable GIF generation for 3D data
+  generate_gif: true
+  gif_output_dir: experiments/{name}/visualization/gifs
+  max_gifs_per_val: 3  # Limit number of GIFs per validation
+
+  # No metrics for real data without clean GT
+  metrics: null
+
+# Logger settings
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 5000
+  use_tb_logger: true
+  keep_ckpt_num: 2  # Keep only 2 latest checkpoints to save disk space
+  keep_state_num: 2  # Keep only 2 latest training states
+  wandb:
+    project: spect229_denoising
+    resume_id: null
+
+# Distributed training settings
+dist_params:
+  backend: nccl
+  port: 29500
+

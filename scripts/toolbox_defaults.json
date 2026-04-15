@@ -1,0 +1,15 @@
+{
+  "log1p": true,
+  "metrics": true,
+  "disable_cudnn": true,
+  "overwrite": true,
+  "rerun_denoise": true,
+  "rerun_recon": false,
+  "device": "cuda",
+  "iterations": 10,
+  "views_per_subset": null,
+  "poisson_bin_width": 1.0,
+  "poisson_min_count": 20000
+}
+
+

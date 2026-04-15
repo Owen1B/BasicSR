@@ -167,6 +167,13 @@ if __name__ == '__main__':
         license='Apache License 2.0',
         setup_requires=['cython', 'numpy', 'torch'],
         install_requires=get_requirements(),
+        entry_points={
+            'console_scripts': [
+                'prime-train=prime.train:main',
+                'prime-test=prime.test:main',
+                'prime-infer=prime.infer:main',
+            ]
+        },
         ext_modules=ext_modules,
         zip_safe=False,
         **setup_kwargs)

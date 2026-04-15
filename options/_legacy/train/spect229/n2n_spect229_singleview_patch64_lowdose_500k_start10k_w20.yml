@@ -1,0 +1,180 @@
+# Baseline N2N (PoissonNLL) + Low-dose (L1), 500k iters
+#
+# - Only low-dose auxiliary loss is enabled (consistency disabled)
+# - Low-dose weight is intentionally large to dominate (>50%) after start_iter
+
+name: n2n_spect229_singleview_patch64_lowdose_500k_start10k_w20
+model_type: SPECT3DConsistencyModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+auto_resume: true
+
+datasets:
+  train:
+    name: SPECT229_train_n2n_single
+    type: SPECTDatPairedDataset
+    mode: n2n
+    dataroot_gt: datasets/SPECT229_projection_paired
+    height: 128
+    width: 128
+
+    view_mode: split1
+    view_select: both
+    posterior_flip: false
+
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    max_value: 150.0
+    clip_max_value: false
+    norm:
+      type: linear
+
+    # 多通道条件输入：lq = [proj, umap_integral, umap_mip]，gt 仍为 proj（单通道）
+    umap_aux:
+      enable: true
+      root: datasets/SPECT229
+      cache_root: datasets/SPECT229_umap_aux_cache
+      filename: "{patient}_PostAtten.dat"
+      # A/P 规则与 convert_60views_to_ap.py 一致：view0 / view30
+      anterior_view_index: 0
+      posterior_view_index: 30
+      start_angle_deg: -180.0
+      angle_step_deg: 6.0
+      rotate_order: 1
+      use_line_integral: true
+      use_mip: true
+      # 归一化到 [0,1] 的固定上限（可按需要再调）
+      line_integral_max: 2.0
+      mip_max: 0.05
+
+    gt_size: 64
+    use_hflip: false
+    use_rot: false
+
+    start_idx: 0
+    end_idx: 6870
+
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 32
+    dataset_enlarge_ratio: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_mode: null
+
+  val:
+    name: SPECT229_val_projection
+    type: SPECTProjectionEvalDataset
+    dataroot: datasets/SPECT229
+    pattern: "**/*_Proj4Filter.dat"
+    height: 128
+    width: 128
+    views: 60
+    start_idx: 0
+    end_idx: 3
+    num_worker_per_gpu: 1
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+network_g:
+  type: UNetRes
+  in_nc: 3
+  out_nc: 1
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+
+path:
+  pretrain_network_g: experiments/n2n_spect229_singleview_patch64/models/net_g_latest.pth
+  strict_load_g: false
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+
+  optim_g:
+    type: AdamW
+    lr: 0.0001
+    weight_decay: 0.0001
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [500000]
+    restart_weights: [1]
+    eta_min: 1.0e-05
+
+  total_iter: 500000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-09
+    max_value: 150.0
+    norm_type: linear
+
+  # Consistency loss explicitly disabled
+  consistency_opt:
+    loss_weight: 0.0
+    loss_type: l1
+    start_iter: 10000
+    use_ema_teacher: true
+    target: g_on_input
+    detach_target: true
+    domain: count
+    norm_type: linear
+    max_value: 150.0
+
+  # Low-dose loss (random s in [1,4])
+  lowdose_opt:
+    loss_weight: 20.0
+    loss_type: l1
+    start_iter: 10000
+    use_ema_teacher: true
+    detach_target: true
+    domain: count
+    norm_type: linear
+    max_value: 150.0
+    factor_min: 1.0
+    factor_max: 4.0
+    per_sample: false
+
+val:
+  val_freq: 10000
+  save_img: false
+  generate_gif: true
+  gif_output_dir: experiments/{name}/visualization/gifs
+  max_gifs_per_val: 3
+  poisson_calibration_opt:
+    enable: true
+    bin_width: 1.0
+    max_bin: 150.0
+    min_count: 20000
+    out_dir: experiments/{name}/visualization/poisson_fit/iter{iter}
+  metrics: null
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 5000
+  use_tb_logger: true
+  keep_ckpt_num: 2
+  keep_state_num: 2
+  wandb:
+    project: spect229_denoising
+    resume_id: null
+
+dist_params:
+  backend: nccl
+  port: 29500
+
+
+

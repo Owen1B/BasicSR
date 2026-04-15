@@ -1,0 +1,110 @@
+name: converged_planar_2d_2view_multidose_N_clinical_fullimg_gated_fusion_scratch
+model_type: SPECTModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+auto_resume: false
+
+datasets:
+  train:
+    name: clinical198_train_planar_2d_2view_multidose_N_fullimg
+    type: SPECTTrainDataset
+    phase: train
+    mode: poisson_thinning
+    input_layout: ap2
+    dataroot_gt: datasets/spectH_clinical_new
+    pattern_gt: "*.dat"
+    views: 2
+    dtype: float32
+    height: 1024
+    width: 256
+    posterior_flip: true
+    view_sampler:
+      mode: opposite_pair
+      offset: 1
+    pack_mode: 2d_channel
+    start_idx: 0
+    end_idx: 192
+    use_hflip: false
+    use_rot: false
+    gt_scale_factor: 1.0
+    max_value: 150.0
+    clip_max_value: false
+    norm:
+      type: linear
+    poisson_thinning_mode: same_dose
+    poisson_thinning_k_choices: [2, 3, 4, 5]
+    poisson_thinning_prob: 0.5
+    poisson_thinning_random_swap: false
+    poisson_thinning_round_mode: nearest
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 2
+    dataset_enlarge_ratio: 1
+    pin_memory: true
+    persistent_workers: true
+
+network_g:
+  type: PlanarGatedUNetRes
+  in_nc: 2
+  out_nc: 2
+  nc: [64, 128, 256, 512]
+  nb: 4
+  act_mode: R
+  downsample_mode: strideconv
+  upsample_mode: convtranspose
+  bias: false
+  global_residual: true
+  fusion_levels: [body, up3, up2]
+  fusion_attention_heads: [8, 4, 4]
+  fusion_attention_pool: [32, 16]
+  gate_bias: -2.0
+  use_attention: true
+
+path:
+  pretrain_network_g: null
+  strict_load_g: false
+  resume_state: null
+
+train:
+  ema_decay: 0.999
+  pbar: true
+  accumulation_steps: 3
+  optim_g:
+    type: AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [500000]
+    restart_weights: [1]
+    eta_min: 1.0e-5
+  total_iter: 500000
+  warmup_iter: -1
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-9
+    max_value: 150.0
+    norm_type: linear
+  view_fusion_regularizer:
+    enable: false
+    self_consistency_weight: 0.05
+    self_consistency_prob: 1.0
+    wrong_pair_weight: 0.05
+    wrong_pair_prob: 0.25
+    posterior_channel_weight: 2.0
+    gate_sparsity_weight: 1.0e-4
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 1000
+  keep_ckpt_num: 3
+  keep_state_num: 3
+  use_tb_logger: true
+  wandb: null
+
+dist_params:
+  backend: nccl
+  port: 29500

@@ -1,0 +1,161 @@
+# L-size "fixed-dose" N2N training on 60-view full-volume 3D UNet (from scratch, k=2 only)
+# - Same as L_scratch, but ONLY one dose factor is sampled during training.
+# - Fixed: k = 2. (If you want another single k, edit n2n_k_choices.)
+#
+# 2-GPU recommended launch:
+#   CUDA_VISIBLE_DEVICES=0,1 PORT=4321 \
+#   ./scripts/dist_train.sh 2 options/train/spect229/n2n_spect229_60view3d_unet_projonly_full_multidose_L_scratch_2dose.yml
+
+name: n2n_spect229_60view3d_unet_projonly_full_multidose_L_scratch_k2
+model_type: SPECT3DModel
+scale: 1
+num_gpu: 2
+manual_seed: 20020113
+auto_resume: true
+
+datasets:
+  train:
+    name: spect229_train_60view_full
+    type: SPECT60ViewVolumeDataset
+    phase: train
+    mode: n2n
+    dataroot_gt: datasets/SPECT229
+    pattern_gt: "**/*_Proj4Filter.dat"
+    views: 60
+    height: 128
+    width: 128
+    dtype: uint16
+    max_value: 150.0
+    gt_scale_factor: 1.0
+    clip_max_value: false
+
+    # Fixed-dose N2N (same-dose two-split thinning)
+    n2n_split_mode: same_dose
+    n2n_k_choices: [2]
+    n2n_p: 0.5
+    n2n_random_swap: false
+    n2n_round: nearest
+
+    start_idx: 4
+    end_idx: 229
+
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 3
+    pin_memory: true
+    persistent_workers: true
+
+  val:
+    name: SPECT229_val_projection
+    type: SPECTProjectionEvalDataset
+    dataroot: datasets/SPECT229
+    pattern: "**/*_Proj4Filter.dat"
+    height: 128
+    width: 128
+    views: 60
+    start_idx: 0
+    end_idx: 4
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+network_g:
+  type: UNet3DRes
+  in_nc: 1
+  out_nc: 1
+  nc: [32, 64, 128, 256]
+  nb: 4
+  bias: false
+  global_residual: true
+  circular_depth: true
+  act: relu
+
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  pbar: true
+  disable_cudnn: false
+  amp:
+    enable: false
+    dtype: bf16
+    loss_fp32: true
+    use_scaler: false
+  ema_decay: 0.999
+  accumulation_steps: 2
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [500000]
+    restart_weights: [1]
+    eta_min: !!float 1e-5
+
+  total_iter: 500000
+  warmup_iter: -1
+
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-09
+    max_value: 150.0
+    norm_type: linear
+
+val:
+  val_freq: 1000
+  save_img: false
+  generate_gif: false
+  generate_mp4_thin_factors: true
+  mp4_output_dir: experiments/{name}/visualization/mp4s
+  # Keep validation MP4 aligned with the training dose (faster val).
+  mp4_thin_factors: [2]
+  mp4_thin_seed: 123
+  mp4_fps: 10
+  mp4_crf: 18
+  mp4_log1p: true
+  max_gifs_per_val: 4
+  save_best_ckpt: true
+  best_metric: lpips_poisson_mean_alex_ema
+  eval_networks: [ema]
+  poisson_calibration_opt:
+    enable: true
+    bin_width: 1.0
+    max_bin: 50.0
+    min_count: 10000
+    out_dir: experiments/{name}/analysis/poisson_calibration_iter{iter}
+  compute_lpips_poisson_vs_original: true
+  lpips_nets: [alex, vgg]
+  lpips_poisson_repeats_alex: 100
+  lpips_poisson_repeats_vgg: 10
+  lpips_view_stride: 1
+  lpips_max_value: 150.0
+  lpips_poisson_batch: 4
+  lpips_poisson_view_chunk: 10
+  metrics:
+    lpips_poisson_mean_alex:
+      type: lpips_poisson_mean
+      better: lower
+      lpips_net: alex
+      repeats: 100
+      max_value: 150.0
+    pll_mean:
+      type: pll
+      better: lower
+      full: true
+      eps: 1.0e-08
+  persist_best_metrics: true
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 1000
+  keep_ckpt_num: 15
+  keep_state_num: 2
+  use_tb_logger: true
+  wandb: null
+
+

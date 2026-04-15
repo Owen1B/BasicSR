@@ -1,0 +1,72 @@
+# Test the L-size multidose model (UNet3DRes L) on val split with MP4 generation.
+#
+# Run:
+#   cd /root/shared-nvme/BasicSR
+#   PYTHONPATH="./:${PYTHONPATH}" CUDA_VISIBLE_DEVICES=0 \
+#   python basicsr/test.py -opt options/test/spect229/test_n2n_spect229_60view3d_unet_projonly_full_multidose_L_pretrain_from_Lk2_91k_mp4.yml
+
+name: test_n2n_spect229_60view3d_unet_projonly_full_multidose_L_pretrain_from_Lk2_91k_mp4
+model_type: SPECT3DModel
+scale: 1
+num_gpu: 1
+manual_seed: 20020113
+
+datasets:
+  test:
+    name: SPECT229_val_projection
+    type: SPECTProjectionEvalDataset
+    dataroot: datasets/SPECT229
+    pattern: "**/*_Proj4Filter.dat"
+    height: 128
+    width: 128
+    views: 60
+    start_idx: 0
+    end_idx: 4
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+network_g:
+  type: UNet3DRes
+  in_nc: 1
+  out_nc: 1
+  nc: [32, 64, 128, 256]
+  nb: 4
+  bias: false
+  global_residual: true
+  circular_depth: true
+  act: relu
+
+path:
+  pretrain_network_g: /root/shared-nvme/BasicSR/experiments/n2n_spect229_60view3d_unet_projonly_full_multidose_L_pretrain_from_Lk2_91k/models/net_g_best.pth
+  param_key_g: params_ema
+  strict_load_g: true
+
+val:
+  save_img: false
+  generate_gif: false
+  generate_mp4_thin_factors: true
+  # Subsample views for MP4 rendering: 60 -> 30 (0,2,4,...)
+  view_stride: 2
+
+  # Write into results/ (test mode)
+  mp4_output_dir: results/{name}/visualization/mp4s
+  mp4_thin_factors: [2, 3, 4, 5]
+  mp4_thin_seed: 123
+  mp4_fps: 10
+  mp4_crf: 18
+  mp4_log1p: true
+
+  # Avoid requiring precomputed dataset cache; generate thins on-the-fly if cache missing.
+  mp4_require_cached_thins: false
+
+  # Generate MP4s for all 4 validation patients
+  max_gifs_per_val: 4
+  eval_networks: [ema]
+
+logger:
+  print_freq: 50
+  use_tb_logger: false
+  wandb: null
+
+

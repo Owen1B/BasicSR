@@ -1,0 +1,133 @@
+name: converged_tomo_3d_nview_multidose_L_scratch
+model_type: SPECTModel
+scale: 1
+num_gpu: 2
+manual_seed: 20020113
+auto_resume: false
+
+datasets:
+  train:
+    name: spect229_train_tomo_3d_nview_multidose_L
+    type: SPECTTrainDataset
+    phase: train
+    mode: poisson_thinning
+    input_layout: volume
+    dataroot_gt: datasets/SPECT229
+    pattern_gt: "**/*_Proj4Filter.dat"
+    views: 60
+    height: 128
+    width: 128
+    dtype: uint16
+    view_sampler:
+      mode: n_views
+      n_views: 60
+      strategy: fixed
+      start: 0
+    pack_mode: 3d_depth
+    max_value: 150.0
+    gt_scale_factor: 1.0
+    clip_max_value: false
+    # Old config mapping:
+    #   n2n_split_mode: same_dose + n2n_k_choices:[2,3,4,5]
+    # -> mainline:
+    #   mode: poisson_thinning + poisson_thinning_mode: same_dose + poisson_thinning_k_choices
+    poisson_thinning_mode: same_dose
+    poisson_thinning_k_choices: [2, 3, 4, 5]
+    poisson_thinning_prob: 0.5
+    poisson_thinning_random_swap: false
+    poisson_thinning_round_mode: nearest
+    start_idx: 4
+    end_idx: 229
+    num_worker_per_gpu: 16
+    batch_size_per_gpu: 3
+    pin_memory: true
+    persistent_workers: true
+
+  val:
+    name: spect229_val_projection_multidose_L
+    type: SPECTProjectionEvalDataset
+    phase: val
+    dataroot: datasets/SPECT229
+    pattern: "**/*_Proj4Filter.dat"
+    views: 60
+    height: 128
+    width: 128
+    dtype: uint16
+    start_idx: 0
+    end_idx: 4
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    pin_memory: true
+
+network_g:
+  type: UNet3DRes
+  in_nc: 1
+  out_nc: 1
+  nc: [32, 64, 128, 256]
+  nb: 4
+  bias: false
+  global_residual: true
+  circular_depth: true
+  act: relu
+
+path:
+  pretrain_network_g: null
+  strict_load_g: true
+  resume_state: null
+
+train:
+  pbar: true
+  disable_cudnn: false
+  amp:
+    enable: false
+    dtype: bf16
+    loss_fp32: true
+    use_scaler: false
+  ema_decay: 0.999
+  accumulation_steps: 2
+  optim_g:
+    type: AdamW
+    lr: 5.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [500000]
+    restart_weights: [1]
+    eta_min: 1.0e-5
+  total_iter: 500000
+  warmup_iter: -1
+  pixel_opt:
+    type: PoissonNLLLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: 1.0e-9
+    max_value: 150.0
+    norm_type: linear
+
+val:
+  val_freq: 1000
+  save_img: false
+  generate_gif: false
+  generate_mp4_thin_factors: false
+  eval_networks: [ema]
+  save_best_ckpt: false
+  metrics:
+    pll_mean:
+      type: pll
+      better: lower
+      full: true
+      eps: 1.0e-08
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 1000
+  keep_ckpt_num: 15
+  keep_state_num: 2
+  use_tb_logger: true
+  wandb: null
+
+
+dist_params:
+  backend: nccl
+  port: 29500
